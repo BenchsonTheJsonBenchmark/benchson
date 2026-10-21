@@ -10,10 +10,9 @@
       "model": "${WATSONX_MODEL_ID}",
       "api_endpoint": "${WATSONX_URL:-https://us-south.ml.cloud.ibm.com/}",
       "model_params": {
-        "max_tokens": 4096,
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "chat_template_kwargs": {"enable_thinking": false}
+        "max_new_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.95
       }
     }
   },
