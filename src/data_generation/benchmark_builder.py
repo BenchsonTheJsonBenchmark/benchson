@@ -67,7 +67,10 @@ class BenchmarkBuilder:
             self.counts_by_split = {"test": counts_cfg}
             self.gates_by_split = {"test": self._parse_gates(val_cfg)}
 
-        data_root = os.path.join(os.getcwd(), "data")
+        # `output_root` redirects where instances are written (used by preview runs so they
+        # never touch data/). Schemas are still read from data/ as before.
+        data_root = os.path.abspath(config["output_root"]) if config.get("output_root") \
+            else os.path.join(os.getcwd(), "data")
         self.base = {
             "create": os.path.join(data_root, config.get("create_dataset", "benchmark_create")),
             "fix": os.path.join(data_root, config.get("fix_dataset", "benchmark_fix")),

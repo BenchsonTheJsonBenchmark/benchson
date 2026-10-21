@@ -1,0 +1,20 @@
+{
+  "_comment": "Same preview, but with an offline mock instead of a model. Free; used to test the pipeline itself. Its output is NOT real data.",
+
+  "llm_provider": {
+    "module": "src.llm.mock.mock_provider",
+    "class": "MockProvider",
+    "params": {}
+  },
+
+  "sources": [
+    {"name": "schemas", "max_schema_kb": 10}
+  ],
+  "max_retries": 2,
+  "seed": 0,
+  "concurrency": 1,
+
+  "validation": {
+    "round_trip": false
+  }
+}

@@ -177,6 +177,8 @@ cython_debug/
 .vscode/
 configs/*
 !configs/example.json
+# Preview configs hold no secrets (only ${ENV_VAR} placeholders), so they are tracked.
+!configs/preview_*.json
 outputs/
 CLAUDE.md
 

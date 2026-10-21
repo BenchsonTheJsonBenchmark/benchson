@@ -1,0 +1,31 @@
+{
+  "_comment": "Small preview of the benchmark build on WatsonX. No secrets here: values written as dollar-brace placeholders come from environment variables. Required: WATSONX_API_KEY, WATSONX_PROJECT_ID, WATSONX_MODEL_ID. Optional: WATSONX_URL.",
+
+  "llm_provider": {
+    "module": "src.llm.watsonx.watsonx_provider",
+    "class": "IBMWatsonXProvider",
+    "params": {
+      "api_key": "${WATSONX_API_KEY}",
+      "project_id": "${WATSONX_PROJECT_ID}",
+      "model": "${WATSONX_MODEL_ID}",
+      "api_endpoint": "${WATSONX_URL:-https://us-south.ml.cloud.ibm.com/}",
+      "model_params": {
+        "max_tokens": 4096,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": false}
+      }
+    }
+  },
+
+  "sources": [
+    {"name": "schemas", "max_schema_kb": 10}
+  ],
+  "max_retries": 2,
+  "seed": 0,
+  "concurrency": 1,
+
+  "validation": {
+    "round_trip": false
+  }
+}
