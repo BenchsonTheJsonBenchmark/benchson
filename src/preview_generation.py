@@ -29,7 +29,7 @@ from config_utils import expand_env, load_env_file
 from data_generation.benchmark_builder import BenchmarkBuilder
 from evaluations import metrics
 from llm.llm_provider import LLMProvider
-from llm.recording_provider import CallBudget, CallBudgetExceeded, RecordingProvider
+from llm.recording_provider import CallBudget, CallBudgetExceeded, ProviderFailing, RecordingProvider
 
 _TASKS = ("create", "fix", "modify")
 _DEFAULT_WATSONX_URL = "https://us-south.ml.cloud.ibm.com/"
@@ -281,7 +281,7 @@ def run(args):
     stopped = None
     try:
         BenchmarkBuilder(cfg).build(builder_llm, validator_llm)
-    except CallBudgetExceeded as e:
+    except (CallBudgetExceeded, ProviderFailing) as e:
         stopped = str(e)
         print(f"\nStopped early: {stopped}")
     elapsed = round(time.time() - started, 1)

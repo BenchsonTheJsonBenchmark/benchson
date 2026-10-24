@@ -25,13 +25,39 @@ class CallBudgetExceeded(BaseException):
     """
 
 
-class CallBudget:
-    """A shared counter, so the builder and validator models draw from one budget."""
+class ProviderFailing(BaseException):
+    """Raised when several model calls in a row failed.
 
-    def __init__(self, max_calls=None):
+    That is almost always a setup problem (credentials, project, model id), which
+    retrying cannot fix. Stopping at once is clearer and cheaper than letting the
+    builder skip schema after schema. A BaseException for the same reason as above.
+    """
+
+
+class CallBudget:
+    """A shared counter, so the builder and validator models draw from one budget.
+
+    It also counts consecutive failures across both models.
+    """
+
+    def __init__(self, max_calls=None, max_consecutive_errors=3):
         self.max_calls = max_calls
+        self.max_consecutive_errors = max_consecutive_errors
         self.used = 0
+        self.consecutive_errors = 0
         self._lock = threading.Lock()
+
+    def succeeded(self):
+        with self._lock:
+            self.consecutive_errors = 0
+
+    def failed(self, error):
+        with self._lock:
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.max_consecutive_errors:
+                raise ProviderFailing(
+                    f"{self.consecutive_errors} model calls in a row failed - stopping instead of "
+                    f"retrying. Last error: {str(error)[:500]}")
 
     def take(self):
         with self._lock:
@@ -59,9 +85,11 @@ class RecordingProvider(LLMProvider):
         response, error = None, None
         try:
             response, _ = self.inner.generate(messages, parameters)
+            self.budget.succeeded()
             return response
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
+            self.budget.failed(error)
             raise
         finally:
             record = {
