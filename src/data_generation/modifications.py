@@ -8,7 +8,7 @@ guaranteed to stay schema-valid (an array clear that would drop below `minItems`
 for instance, is rejected and another edit is chosen).
 
 Coverage: array edits, scalar value changes, and field add/remove, over top-level
-fields and one level of nesting inside object-valued properties.
+fields and, recursively, over every nested object-valued property (any depth).
 """
 
 import copy
@@ -52,24 +52,37 @@ def apply_change(reference_json, schema, rng):
 # ---------------------------------------------------------------- candidate discovery
 
 def _candidates(obj, schema):
-    """Yields edit candidates over top-level fields and one nested object level."""
-    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-    required = schema.get("required", []) if isinstance(schema, dict) else []
+    """Yields edit candidates for the root object and every nested object, at any depth."""
+    yield from _walk_object_candidates(obj, schema, path_prefix=[])
 
-    yield from _object_field_candidates(obj, props, required, parent=None)
 
-    # one level of nesting: into object-valued top-level properties
+def _walk_object_candidates(obj, schema, path_prefix):
+    """Candidates for one object, then recursion into its object-valued children.
+
+    `schema` is the sub-schema describing `obj`; each child gets the matching property
+    sub-schema, so `required`/constraints are honoured at every level. Only dict values
+    are followed (arrays of objects are not traversed yet). The recursion follows the
+    data, which is finite, so it always terminates.
+    """
+    schema = _subschema(schema)
+    props = schema.get("properties", {})
+    required = schema.get("required", [])
+
+    yield from _object_field_candidates(obj, props, required, path_prefix)
+
     for key, value in obj.items():
         if isinstance(value, dict):
-            sub = _subschema(props.get(key))
-            yield from _object_field_candidates(
-                value, sub.get("properties", {}), sub.get("required", []), parent=key
-            )
+            yield from _walk_object_candidates(value, props.get(key), path_prefix + [key])
 
 
-def _object_field_candidates(obj, props, required, parent):
-    """Candidates for the fields of one object (its keys) plus add-missing-field."""
-    base_path = [parent] if parent else []
+def _object_field_candidates(obj, props, required, parent_path):
+    """Candidates for the fields of one object (its keys) plus add-missing-field.
+
+    `parent_path` is the list of keys leading to this object ([] for the root).
+    """
+    base_path = list(parent_path)
+    # Label used in the human-readable instructions, e.g. settings.server.network
+    parent = ".".join(str(k) for k in parent_path) or None
 
     for key, value in obj.items():
         path = base_path + [key]
