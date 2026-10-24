@@ -9,6 +9,10 @@ for instance, is rejected and another edit is chosen).
 
 Coverage: array edits, scalar value changes, and field add/remove, over top-level
 fields and, recursively, over every nested object-valued property (any depth).
+
+Selection is random but complexity-aware: every candidate gets a simple score (see
+`_candidate_complexity`) and candidates are tried in a weighted random order, so deeper
+and structurally richer edits are chosen more often than trivial top-level ones.
 """
 
 import copy
@@ -24,12 +28,15 @@ def apply_change(reference_json, schema, rng):
     """Returns (modified_json, change_spec) or None if no valid edit was found.
 
     change_spec = {"op": str, "path": list, "precise_instruction": str}.
+
+    Candidates are tried in a weighted random order driven by `rng` (higher complexity =
+    more likely to come first); the first edit that changes the object and still passes
+    full schema validation wins. At most `_MAX_TRIES` candidates are tried, each once.
     """
     if not isinstance(reference_json, dict):
         return None
 
-    candidates = list(_candidates(reference_json, schema))
-    rng.shuffle(candidates)
+    candidates = _weighted_order(list(_candidates(reference_json, schema)), rng)
 
     for cand in candidates[:_MAX_TRIES]:
         modified = copy.deepcopy(reference_json)
@@ -47,6 +54,49 @@ def apply_change(reference_json, schema, rng):
             "precise_instruction": cand["instruction"],
         }
     return None
+
+
+# ---------------------------------------------------------------- complexity-aware selection
+
+_OP_BASE_SCALAR = 1   # set/increment/decrement a scalar, toggle a bool, switch an enum
+_OP_BASE_FIELD = 2    # add or delete a field
+_OP_BASE_ARRAY = 3    # any array_* edit
+
+
+def _candidate_complexity(candidate):
+    """Simple, explainable complexity score of one edit candidate (higher = harder).
+
+        score = operation base + (path depth - 1)
+
+    Operation base: scalar edit 1, add/delete field 2, array edit 3. The depth term adds
+    1 for every level below the top, so ["port"] scores lower than
+    ["settings", "server", "network", "port"] for the same operation. Only `op` and
+    `path` are read, so a stored change spec can be scored too.
+    """
+    op = candidate["op"]
+    if op.startswith("array_"):
+        base = _OP_BASE_ARRAY
+    elif op in ("add_field", "delete_field"):
+        base = _OP_BASE_FIELD
+    else:
+        base = _OP_BASE_SCALAR
+    depth = max(len(candidate["path"]), 1)
+    return base + (depth - 1)
+
+
+def _weighted_order(candidates, rng):
+    """Returns the candidates in a random order that favours higher complexity.
+
+    Weighted sampling without replacement via an "exponential race": each candidate draws
+    Exp(1) / weight, and candidates are ordered by that time (smallest first). The first
+    pick is chosen with probability weight / total weight, then the next from the rest,
+    and so on - so every candidate appears exactly once and nothing is ever retried.
+    Only the supplied `rng` is used (never the global random module); ties keep the
+    original order, so the result is fully determined by the rng state.
+    """
+    timed = [(rng.expovariate(1.0) / _candidate_complexity(c), i) for i, c in enumerate(candidates)]
+    timed.sort()
+    return [candidates[i] for _, i in timed]
 
 
 # ---------------------------------------------------------------- candidate discovery
