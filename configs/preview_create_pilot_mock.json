@@ -1,0 +1,34 @@
+{
+  "_comment": "Same pilot with the offline mock instead of a model. Free; only tests the pipeline/plumbing. Output is NOT real data.",
+  "llm_provider": {
+    "module": "src.llm.mock.mock_provider",
+    "class": "MockProvider",
+    "params": {}
+  },
+  "experiment": {
+    "_comment": "Experimental sampling tiers only (chosen with a temporary heuristic); NOT a Benchson definition of complexity.",
+    "tiers": {
+      "LOW": [
+        "data/schemas/test/typingsrc.json",
+        "data/schemas/test/one-changelog-schema-0.1.json",
+        "data/schemas/test/drupal-links-action.json"
+      ],
+      "MEDIUM": [
+        "data/schemas/test/nodehawkrc.json",
+        "data/schemas/test/devinit.schema-2.0.json",
+        "data/schemas/test/gematik-test-hcps.json"
+      ],
+      "HIGH": [
+        "data/schemas/test/aiproj-1.0.json",
+        "data/schemas/test/asconfig-schema.json",
+        "data/schemas/test/azure-iot-edgehub-deployment-1.2.json"
+      ]
+    }
+  },
+  "max_retries": 2,
+  "seed": 0,
+  "concurrency": 1,
+  "validation": {
+    "round_trip": false
+  }
+}

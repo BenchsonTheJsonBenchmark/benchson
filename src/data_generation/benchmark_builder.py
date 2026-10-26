@@ -104,6 +104,7 @@ class BenchmarkBuilder:
             paths = loader.load_instances(
                 source=name,
                 filter_kw=src.get("filter"),
+                files=src.get("files"),
                 max_schema_kb=src.get("max_schema_kb", 10),
             )
             for path in paths:

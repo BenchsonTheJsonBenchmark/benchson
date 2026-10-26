@@ -1,0 +1,44 @@
+{
+  "_comment": "Create complexity pilot on WatsonX. Same model settings as preview_watsonx_granite.json. No secrets: environment-variable values come from environment variables (WATSONX_API_KEY, WATSONX_PROJECT_ID, WATSONX_MODEL_ID; optional WATSONX_URL). Run with src/preview_create_pilot.py.",
+  "llm_provider": {
+    "module": "src.llm.watsonx.watsonx_provider",
+    "class": "IBMWatsonXProvider",
+    "params": {
+      "api_key": "${WATSONX_API_KEY}",
+      "project_id": "${WATSONX_PROJECT_ID}",
+      "model": "${WATSONX_MODEL_ID}",
+      "api_endpoint": "${WATSONX_URL:-https://us-south.ml.cloud.ibm.com/}",
+      "model_params": {
+        "max_new_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.95
+      }
+    }
+  },
+  "experiment": {
+    "_comment": "Experimental sampling tiers only (chosen with a temporary heuristic); NOT a Benchson definition of complexity.",
+    "tiers": {
+      "LOW": [
+        "data/schemas/test/typingsrc.json",
+        "data/schemas/test/one-changelog-schema-0.1.json",
+        "data/schemas/test/drupal-links-action.json"
+      ],
+      "MEDIUM": [
+        "data/schemas/test/nodehawkrc.json",
+        "data/schemas/test/devinit.schema-2.0.json",
+        "data/schemas/test/gematik-test-hcps.json"
+      ],
+      "HIGH": [
+        "data/schemas/test/aiproj-1.0.json",
+        "data/schemas/test/asconfig-schema.json",
+        "data/schemas/test/azure-iot-edgehub-deployment-1.2.json"
+      ]
+    }
+  },
+  "max_retries": 2,
+  "seed": 0,
+  "concurrency": 1,
+  "validation": {
+    "round_trip": false
+  }
+}
