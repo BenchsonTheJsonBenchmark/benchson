@@ -41,10 +41,23 @@ class ErrorCorrectionTask(BaseDataTask):
         return messages, valid_json_str
 
 
-def _inject_error(valid_json, schema):
-    """Applies a single random schema-violating mutation. Returns None if no mutation is possible."""
+def _inject_error(valid_json, schema, rng=None):
+    """Applies a single random schema-violating mutation. Returns None if no mutation is possible.
+
+    `rng` (a random.Random) makes the choice reproducible; without it the global `random`
+    module is used, as before.
+    """
+    return _inject_error_info(valid_json, schema, rng)[0]
+
+
+def _inject_error_info(valid_json, schema, rng=None):
+    """Like `_inject_error`, but returns (erroneous_or_None, {"kind", "field"}_or_None).
+
+    The info names the mutation that was applied, for metadata. The mutation set and the
+    way one is picked are exactly those of the original single-error injector.
+    """
     if not isinstance(valid_json, dict):
-        return None
+        return None, None
 
     props = schema.get("properties", {})
     required = schema.get("required", [])
@@ -147,20 +160,23 @@ def _inject_error(valid_json, schema):
                 mutations.append(("nested_remove_required", field, nf))
 
     if not mutations:
-        return None
+        return None, None
 
-    chosen = random.choice(mutations)
+    chosen = (rng or random).choice(mutations)
     kind = chosen[0]
     field = chosen[1] if len(chosen) > 1 else None
+    info = {"kind": kind, "field": field}
+    if kind == "nested_remove_required":
+        info["nested_field"] = chosen[2]
 
     # ── apply chosen mutation ─────────────────────────────────────────────────
 
     if kind == "additional_property":
         erroneous["__invalid_field__"] = "invalid"
-        return erroneous
+        return erroneous, info
 
     if field is None:
-        return erroneous
+        return erroneous, info
 
     if kind == "remove_required":
         del erroneous[field]
@@ -223,4 +239,4 @@ def _inject_error(valid_json, schema):
         nested_field = chosen[2]
         del erroneous[field][nested_field]
 
-    return erroneous
+    return erroneous, info

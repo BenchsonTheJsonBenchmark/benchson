@@ -1,0 +1,15 @@
+{
+  "_comment": "Writes an EXPANDED copy to data/jsb_schemas_expanded (never over data/jsb_schemas). Same seed, split, size limit and subset ORDER as the default import, so the original schemas should be a subset (verify with: python src/analyze_schema_pool.py --expanded-source jsb_schemas_expanded). Counts are 'take all eligible'. Needs network access to Hugging Face (small download, no model). The v2 import config itself is not in the repo; split/seed/subset order below are the importer defaults and UNVERIFIED.",
+  "output_dataset": "jsb_schemas_expanded",
+  "split": "test",
+  "seed": 0,
+  "max_schema_kb": 10,
+  "subsets": {
+    "Github_easy": 100000,
+    "Github_medium": 100000,
+    "Github_hard": 100000,
+    "Kubernetes": 100000,
+    "Snowplow": 100000,
+    "Glaiveai2K": 100000
+  }
+}

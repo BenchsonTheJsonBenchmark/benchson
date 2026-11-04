@@ -1,0 +1,55 @@
+{
+  "_comment": "Same as preview_watsonx_granite.json plus the standard/complex mix. Secrets come from .env (see .env.example). Do NOT run on the real model without asking; start with --total-examples 4.",
+  "llm_provider": {
+    "module": "src.llm.watsonx.watsonx_provider",
+    "class": "IBMWatsonXProvider",
+    "params": {
+      "api_key": "${WATSONX_API_KEY}",
+      "project_id": "${WATSONX_PROJECT_ID}",
+      "model": "${WATSONX_MODEL_ID}",
+      "api_endpoint": "${WATSONX_URL:-https://us-south.ml.cloud.ibm.com/}",
+      "model_params": {
+        "max_new_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.95
+      }
+    }
+  },
+  "sources": [
+    {
+      "name": "schemas",
+      "max_schema_kb": 10
+    }
+  ],
+  "max_retries": 2,
+  "seed": 0,
+  "concurrency": 1,
+  "validation": {
+    "round_trip": false
+  },
+  "generation": {
+    "_comment": "Mix of original-style (standard) and harder (complex) examples. Ratios must sum to 1. 'standard' = the original Benchson behaviour; 'complex' = 2-3 edits/errors per example and richer Create references. Remove this whole block to get the legacy behaviour.",
+    "standard_ratio": 0.8,
+    "complex_ratio": 0.2,
+    "standard_modify_strategy": "original",
+    "complex": {
+      "modify": {
+        "min_operations": 2,
+        "max_operations": 3,
+        "attempts": 5
+      },
+      "fix": {
+        "min_errors": 2,
+        "max_errors": 3,
+        "attempts": 5
+      },
+      "create": {
+        "min_leaves": 10,
+        "min_depth": 3,
+        "min_distinct_types": 3,
+        "min_object_arrays": 0
+      },
+      "max_failures_per_example": 5
+    }
+  }
+}

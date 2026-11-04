@@ -118,7 +118,23 @@ class BaseDataTask:
 
     # ------------------------------------------------------------------ helpers
 
-    def _build_schema_creation_prompt(self, schema):
+    # Appended to the creation prompt in complex Create mode only. A first wording to be
+    # reviewed on real model output; the standard prompt is never touched.
+    COMPLEXITY_HINT = (
+        "\n\nMake the object rich and realistic: fill in the optional properties the schema "
+        "defines (not only the required ones), complete nested objects, give every array at "
+        "least two items - and make the items of an array of objects differ from each other - "
+        "and use specific, varied values instead of placeholders. It must still conform "
+        "exactly to the schema."
+    )
+
+    def _build_schema_creation_prompt(self, schema, complexity_hint=False):
+        prompt = self._build_plain_schema_creation_prompt(schema)
+        if complexity_hint:
+            prompt[1] = {**prompt[1], "content": prompt[1]["content"] + self.COMPLEXITY_HINT}
+        return prompt
+
+    def _build_plain_schema_creation_prompt(self, schema):
         return [
             {
                 "role": "system",

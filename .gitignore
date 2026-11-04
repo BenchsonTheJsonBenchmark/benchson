@@ -179,6 +179,9 @@ configs/*
 !configs/example.json
 # Preview configs hold no secrets (only ${ENV_VAR} placeholders), so they are tracked.
 !configs/preview_*.json
+# Scale-only configs hold only ${ENV_VAR} placeholders.
+!configs/scale_only_*.json
+!configs/import_jsonschemabench_expand.json
 outputs/
 CLAUDE.md
 
@@ -187,3 +190,9 @@ data/benchmark_create/
 data/benchmark_fix/
 data/benchmark_modify/
 data/jsb_schemas/
+# Scale-only experiment: baseline import, new run, merged dataset
+data_published/
+data_scale_only/
+data_scale_7k/
+hf_export_7k/
+release/

@@ -1,0 +1,68 @@
+{
+  "_comment": "Scale-only run (100% original-style) with Granite served by vLLM on the cluster. Secrets/hosts come from ${ENV}. seed, sources, max_schema_kb and test_ratio are CONFIRMED from the v2 manifests. temperature 0.7, max_tokens 4096 and top_p 0.95 are OUR PROVISIONAL values: the original ones could not be recovered (docs/original_generation_settings.md). Do not run without approval.",
+  "scale_only": true,
+  "llm_provider": {
+    "module": "src.llm.openai.openai_provider",
+    "class": "OpenAIProvider",
+    "params": {
+      "api_key": "${VLLM_API_KEY:-EMPTY}",
+      "base_url": "${VLLM_BASE_URL:-http://localhost:8000/v1}",
+      "model": "${GRANITE_MODEL_ID}",
+      "drop_empty_assistant_turn": true,
+      "model_params": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.95
+      }
+    }
+  },
+  "sources": [
+    {
+      "name": "schemas",
+      "max_schema_kb": 10
+    },
+    {
+      "name": "jsb_schemas",
+      "max_schema_kb": 10
+    }
+  ],
+  "exclusions": {
+    "file": "data_published/${PUBLISHED_SHA12}/reserved_schemas.json"
+  },
+  "output_root": "data_scale_only/${RUN_NAME:-run1}",
+  "max_retries": 3,
+  "seed": 0,
+  "concurrency": 8,
+  "split": {
+    "test_ratio": 0.15
+  },
+  "counts": {
+    "train": {
+      "create": 1334,
+      "fix": 1333,
+      "modify": 1333
+    }
+  },
+  "validation": {
+    "train": {
+      "round_trip": false
+    }
+  },
+  "generation": {
+    "standard_ratio": 1.0,
+    "complex_ratio": 0.0,
+    "standard_modify_strategy": "original"
+  },
+  "_provenance": "CONFIRMED from the published v2 manifests: sources schemas+jsb_schemas, max_schema_kb 10, seed 0, test_ratio 0.15 (these define the original training pool, so keep them). The ORIGINAL builder was openai/gpt-oss-120b; Granite is a different model. This run keeps the original generation logic, prompts, thresholds and schema pool but CHANGES the original one-example-per-schema policy (see docs/schema_reuse.md). Temperature/max tokens above are our provisional values, not the original ones.",
+  "reuse": {
+    "_comment": "Controlled schema reuse (differs from the original one-example-per-schema policy). Each attempt mints an independent reference with the unchanged standard prompt; a reference equal to a published or earlier new one for that schema is rejected. Cap = max new references per schema (each feeds up to 3 tasks). A schema failing max_failures_per_schema attempts in a row sits out suspend_passes passes (max_suspensions times), then is retired for the run; the target is still pursued with other schemas. sampling_seed_param, e.g. \"seed\", would pass a per-attempt integer to the provider; left null because it is not verified for the Granite endpoint.",
+    "max_new_references_per_schema": 3,
+    "max_failures_per_schema": 3,
+    "suspend_passes": 1,
+    "max_suspensions": 1,
+    "max_attempts_per_schema": 6,
+    "sampling_seed_param": null,
+    "reject_cross_schema_duplicates": false,
+    "dedupe_pool_by_content": true
+  }
+}

@@ -6,6 +6,7 @@ class VLLMProvider(LLMProvider):
     def __init__(self, model, model_params=None, tensor_parallel_size=1, llm_kwargs=None, **kwargs):
         super().__init__(**kwargs)
         self.model_name = model
+        self.model = model
         self.model_params = model_params or {}
         self.tensor_parallel_size = tensor_parallel_size
         self.llm_kwargs = llm_kwargs or {}

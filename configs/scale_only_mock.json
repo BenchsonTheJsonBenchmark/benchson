@@ -1,0 +1,58 @@
+{
+  "_comment": "Offline mock of the scale-only run. Free; tests the pipeline only. Output is NOT real data. Needs data_published/<sha12>/reserved_schemas.json (or a stand-in) from the importer.",
+  "scale_only": true,
+  "llm_provider": {
+    "module": "src.llm.mock.mock_provider",
+    "class": "MockProvider",
+    "params": {}
+  },
+  "sources": [
+    {
+      "name": "schemas",
+      "max_schema_kb": 10
+    },
+    {
+      "name": "jsb_schemas",
+      "max_schema_kb": 10
+    }
+  ],
+  "exclusions": {
+    "file": "data_published/REPLACE_SHA12/reserved_schemas.json"
+  },
+  "output_root": "data_scale_only/mock",
+  "max_retries": 2,
+  "seed": 0,
+  "concurrency": 1,
+  "split": {
+    "test_ratio": 0.15
+  },
+  "counts": {
+    "train": {
+      "create": 1334,
+      "fix": 1333,
+      "modify": 1333
+    }
+  },
+  "validation": {
+    "train": {
+      "round_trip": false
+    }
+  },
+  "generation": {
+    "standard_ratio": 1.0,
+    "complex_ratio": 0.0,
+    "standard_modify_strategy": "original"
+  },
+  "_provenance": "CONFIRMED from the published v2 manifests: sources schemas+jsb_schemas, max_schema_kb 10, seed 0, test_ratio 0.15 (these define the original training pool, so keep them). The ORIGINAL builder was openai/gpt-oss-120b; Granite is a different model. This run keeps the original generation logic, prompts, thresholds and schema pool but CHANGES the original one-example-per-schema policy (see docs/schema_reuse.md). The mock model has no sampling parameters.",
+  "reuse": {
+    "_comment": "Controlled schema reuse (differs from the original one-example-per-schema policy). Each attempt mints an independent reference with the unchanged standard prompt; a reference equal to a published or earlier new one for that schema is rejected. Cap = max new references per schema (each feeds up to 3 tasks). A schema failing max_failures_per_schema attempts in a row sits out suspend_passes passes (max_suspensions times), then is retired for the run; the target is still pursued with other schemas. sampling_seed_param, e.g. \"seed\", would pass a per-attempt integer to the provider; left null because it is not verified for the Granite endpoint.",
+    "max_new_references_per_schema": 3,
+    "max_failures_per_schema": 3,
+    "suspend_passes": 1,
+    "max_suspensions": 1,
+    "max_attempts_per_schema": 6,
+    "sampling_seed_param": null,
+    "reject_cross_schema_duplicates": false,
+    "dedupe_pool_by_content": true
+  }
+}

@@ -8,9 +8,18 @@ folder (never into data/), and produces files meant for a human to read:
   summary.json    the same statistics that are printed to the terminal
   dataset/        the generated instances, in the same layout the full build uses
 
+Standard/complex mix (optional; without these flags and without a "generation" block in the
+config the run is exactly the legacy preview):
+    --mode standard|complex|mixed   --standard-ratio 0.75 --complex-ratio 0.25
+    --tasks create,fix,modify       --count N (per task)   or   --total-examples N (all tasks)
+
 Usage:
     uv run python src/preview_generation.py --config configs/preview_watsonx_granite.json --count 2
     uv run python src/preview_generation.py --config configs/preview_mock.json --count 3
+    uv run python src/preview_generation.py --config configs/preview_complex_mock.json \
+        --total-examples 4 --standard-ratio 0.75 --complex-ratio 0.25
+    uv run python src/preview_generation.py --config configs/preview_complex_mock.json \
+        --tasks modify --mode complex --count 4
     uv run python src/preview_generation.py --list-models granite
 """
 
@@ -27,6 +36,7 @@ import urllib.request
 
 from config_utils import expand_env, load_env_file
 from data_generation.benchmark_builder import BenchmarkBuilder
+from data_generation.generation_mix import split_total
 from evaluations import metrics
 from llm.llm_provider import LLMProvider
 from llm.recording_provider import CallBudget, CallBudgetExceeded, ProviderFailing, RecordingProvider
@@ -61,11 +71,52 @@ def list_models(needle):
 
 # ------------------------------------------------------------------ run
 
+def selected_tasks(args):
+    if not args.tasks:
+        return list(_TASKS)
+    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    unknown = [t for t in tasks if t not in _TASKS]
+    if unknown or not tasks:
+        raise SystemExit(f"--tasks must be a comma-separated subset of {', '.join(_TASKS)} "
+                         f"(got {args.tasks!r})")
+    return [t for t in _TASKS if t in tasks]
+
+
+def requested_counts(args):
+    """{task: examples} for every task (0 for tasks that were not selected)."""
+    tasks = selected_tasks(args)
+    per_task = split_total(args.total_examples, tasks) if args.total_examples is not None \
+        else {t: args.count for t in tasks}
+    return {t: per_task.get(t, 0) for t in _TASKS}
+
+
+def generation_block(config, args):
+    """The "generation" settings for this run, or None for a legacy (all-standard, unchanged) run.
+
+    Precedence: --mode, then --standard-ratio/--complex-ratio, then the config's own block,
+    then (if any flag asked for a mix) the 80/20 default.
+    """
+    block = copy.deepcopy(config.get("generation"))
+    asked = args.mode or args.standard_ratio is not None or args.complex_ratio is not None
+    if block is None and not asked:
+        return None
+    block = block or {}
+    if args.mode == "standard":
+        block["standard_ratio"], block["complex_ratio"] = 1.0, 0.0
+    elif args.mode == "complex":
+        block["standard_ratio"], block["complex_ratio"] = 0.0, 1.0
+    elif args.standard_ratio is not None or args.complex_ratio is not None:
+        s, c = args.standard_ratio, args.complex_ratio
+        block["standard_ratio"] = round(1 - c, 6) if s is None else s
+        block["complex_ratio"] = round(1 - s, 6) if c is None else c
+    return block
+
+
 def build_run_config(config, args, out_dir):
     """Turns a preview config into a builder config: tiny counts, separate output folder."""
     cfg = copy.deepcopy(config)
     # The flat `counts` shape means "test split only, no train/test partition".
-    cfg["counts"] = {task: args.count for task in _TASKS}
+    cfg["counts"] = requested_counts(args)
     cfg["output_root"] = os.path.join(out_dir, "dataset")
     if args.seed is not None:
         cfg["seed"] = args.seed
@@ -75,20 +126,34 @@ def build_run_config(config, args, out_dir):
         validation["round_trip"] = True
     else:
         validation.setdefault("round_trip", False)
+    block = generation_block(config, args)
+    if block is None:
+        cfg.pop("generation", None)
+    else:
+        block["report_dir"] = out_dir
+        cfg["generation"] = block
     return cfg
 
 
 def load_produced(cfg):
-    """Reads back the instances the builder wrote: {task: [(filename, record), ...]}."""
+    """Reads back the instances the builder wrote: {task: [(filename, record, sidecar_or_None), ...]}."""
     produced = {}
     for task in _TASKS:
         folder = os.path.join(cfg["output_root"], cfg.get(f"{task}_dataset", f"benchmark_{task}"), "test")
+        meta_folder = os.path.join(cfg["output_root"], cfg.get(f"{task}_dataset", f"benchmark_{task}"),
+                                   "_metadata", "test")
         items = []
         if os.path.isdir(folder):
             for name in sorted(os.listdir(folder)):
                 if name.endswith(".json"):
                     with open(os.path.join(folder, name), "r", encoding="utf-8") as f:
-                        items.append((name, json.load(f)))
+                        record = json.load(f)
+                    meta = None
+                    meta_path = os.path.join(meta_folder, name)
+                    if os.path.exists(meta_path):
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                    items.append((name, record, meta))
         produced[task] = items
     return produced
 
@@ -187,24 +252,65 @@ def _change_lines(before, after):
     return lines or ["- (no differences)"]
 
 
-def _example_section(task, index, record):
+def _meta_lines(meta):
+    """Mode, complexity and validation lines from the sidecar (empty for legacy runs)."""
+    if not meta:
+        return []
+    comp, val = meta.get("complexity", {}), meta.get("validation") or {}
+    lines = [f"**Mode:** `{meta['mode']}` | seed `{meta['seed']}` | "
+             f"builder LLM calls for this schema: {meta.get('builder_llm_calls_for_schema')}"]
+    ops = comp.get("operations") or comp.get("errors")
+    if ops:
+        lines.append(f"**Complexity:** {ops['count']} change(s) of type {', '.join(ops['types'])} | "
+                     f"max depth {ops['max_depth']} | affected fields {ops['affected_fields']} | "
+                     f"different branches: {ops['different_branches']} | "
+                     f"inside list items: {ops['inside_array_items']}")
+    ref = comp.get("reference")
+    if ref and not ops:
+        lines.append(f"**Complexity:** leaves {ref['leaf_count']} | depth {ref['depth']} | "
+                     f"types {ref['distinct_leaf_types']} | arrays of objects {ref['object_arrays']} "
+                     f"({ref['object_array_items']} items) | constrained leaves "
+                     f"{ref.get('constrained_leaves')}")
+    checks = val.get("checks")
+    if checks:
+        bad = [k for k, v in checks.items() if v is False]
+        skipped = [k for k, v in checks.items() if v is None]
+        lines.append("**Checks:** " + ("all passed" if not bad else "FAILED: " + ", ".join(bad))
+                     + (f" (not applicable: {', '.join(skipped)})" if skipped else ""))
+    elif "grounding_ratio" in val:
+        lines.append(f"**Grounding:** {val['grounding_ratio']} (threshold {val['grounding_threshold']})")
+    for item in meta.get("requires_manual_review") or []:
+        lines.append(f"- needs manual review: {item}")
+    return lines + [""]
+
+
+def _example_section(task, index, record, meta=None):
     tag = "/".join(p for p in (record.get("source"), record.get("subset")) if p)
-    out = [f"### {task} #{index} - {record.get('name')} [{tag}]", ""]
+    out = [f"### {task} #{index} - {record.get('name')} [{tag}]", ""] + _meta_lines(meta)
     if task == "create":
         out += [_shape_line(record["reference_json"]), "", "**Description given to the model:**", "",
                 "> " + record["description"].replace("\n", "\n> "), "",
                 "**Expected JSON:**", "", _json_block(record["reference_json"])]
     elif task == "fix":
         out += [_shape_line(record["valid_json"]), "",
-                "**Injected error (before -> after the fix):**", ""]
+                "**Injected error(s) (before -> after the fix):**", ""]
         out += _change_lines(record["erroneous_json"], record["valid_json"])
+        errors = ((meta or {}).get("complexity", {}).get("errors") or {}).get("errors")
+        if errors:
+            out += ["", "**Recorded errors:**", ""]
+            out += [f"- `{e['kind']}` at `{_fmt_path(e['path'])}`" for e in errors]
         out += ["", "**Expected (valid) JSON:**", "", _json_block(record["valid_json"])]
     else:
         spec = record.get("modification", {})
         out += [_shape_line(record["ground_truth"]), "",
-                f"**Instruction:** {record['instructions']}", "",
-                f"Programmatic edit: `{spec.get('op')}` at `{_fmt_path(spec.get('path', []))}`", "",
-                "**Change (before -> after):**", ""]
+                f"**Instruction:** {record['instructions']}", ""]
+        if spec.get("operations"):
+            out += [f"Programmatic edits ({spec.get('n_operations')}):", ""]
+            out += [f"- `{op['op']}` at `{_fmt_path(op['path'])}`" for op in spec["operations"]]
+            out += [""]
+        else:
+            out += [f"Programmatic edit: `{spec.get('op')}` at `{_fmt_path(spec.get('path', []))}`", ""]
+        out += ["**Change (before -> after):**", ""]
         out += _change_lines(record["data"], record["ground_truth"])
         out += ["", "**Expected JSON after the change:**", "", _json_block(record["ground_truth"])]
     return out + [""]
@@ -228,8 +334,8 @@ def write_review(path, header, produced, log_path):
     for task in _TASKS:
         if not produced[task]:
             lines += [f"(no {task} examples were produced)", ""]
-        for i, (_, record) in enumerate(produced[task], start=1):
-            lines += _example_section(task, i, record)
+        for i, (_, record, meta) in enumerate(produced[task], start=1):
+            lines += _example_section(task, i, record, meta)
     lines += ["## Raw model outputs", "",
               "Exactly what the model returned, before any cleaning. Full text is in llm_calls.jsonl.", ""]
     if os.path.exists(log_path):
@@ -242,6 +348,28 @@ def write_review(path, header, produced, log_path):
 
 
 # ------------------------------------------------------------------ main
+
+def _generation_header(generation):
+    """Requested vs actual standard/complex counts per task, for the review file and terminal."""
+    lines = []
+    for split_name, table in generation["requested"].items():
+        for task, modes in table.items():
+            actual = generation["produced_on_disk"][split_name][task]
+            if not sum(modes.values()):
+                continue
+            lines.append(f"- {task}: standard {actual['standard']}/{modes['standard']}, "
+                         f"complex {actual['complex']}/{modes['complex']}")
+    totals = generation["totals"]
+    lines.append(f"- total: standard {totals['produced_standard']}/{totals['requested_standard']}, "
+                 f"complex {totals['produced_complex']}/{totals['requested_complex']} "
+                 f"(failed attempts: {totals['failed_attempts']})")
+    for item in generation["shortfall"]:
+        lines.append(f"- SHORTFALL {item['task']}/{item['mode']}: {item['produced']}/{item['requested']} "
+                     f"({item['reason']})")
+    for key, n in generation["failure_reasons"].items():
+        lines.append(f"- failure {key}: {n}")
+    return lines
+
 
 def run(args):
     with open(args.config, "r", encoding="utf-8") as f:
@@ -274,13 +402,16 @@ def run(args):
         json.dump(raw_config, f, indent=2)
 
     print(f"Preview run -> {out_dir}")
-    print(f"  model: {builder_llm.model} | examples per task: {args.count} | "
+    requested = cfg["counts"]
+    print(f"  model: {builder_llm.model} | requested per task: "
+          + ", ".join(f"{t} {requested[t]}" for t in _TASKS) + " | "
           f"max LLM calls: {args.max_llm_calls} | round-trip gate: {cfg['validation']['round_trip']}")
 
+    builder = BenchmarkBuilder(cfg)
     started = time.time()
     stopped = None
     try:
-        BenchmarkBuilder(cfg).build(builder_llm, validator_llm)
+        builder.build(builder_llm, validator_llm)
     except (CallBudgetExceeded, ProviderFailing) as e:
         stopped = str(e)
         print(f"\nStopped early: {stopped}")
@@ -290,13 +421,18 @@ def run(args):
     stats = summarize_calls(log_path)
     counts = {task: len(items) for task, items in produced.items()}
 
-    summary = {"model": builder_llm.model, "requested_per_task": args.count, "produced": counts,
-               "stopped_early": stopped, "seconds": elapsed, "llm": stats}
+    generation = builder.last_summary   # None for a legacy (no "generation" block) run
+    summary = {"model": builder_llm.model, "requested_per_task": requested, "produced": counts,
+               "stopped_early": stopped, "seconds": elapsed, "llm": stats,
+               "generation": generation and {k: generation[k] for k in (
+                   "generation", "requested", "produced_on_disk", "failed_attempts", "totals",
+                   "shortfall", "failure_reasons", "validation_check_failures", "complexity")}}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     header = [f"- Model: `{builder_llm.model}`",
-              f"- Examples per task: requested {args.count}, produced "
+              "- Examples per task: requested "
+              + ", ".join(f"{t} {requested[t]}" for t in _TASKS) + ", produced "
               + ", ".join(f"{t} {counts[t]}" for t in _TASKS),
               f"- LLM calls: {stats['calls']} (errors: {stats['errors']}), "
               f"avg {stats['avg_seconds']}s, max {stats['max_seconds']}s",
@@ -304,13 +440,18 @@ def run(args):
               f"- Calls that should return only JSON: {stats['json_expected_calls']} -> "
               f"clean {stats['json_clean']}, inside a code fence {stats['json_in_code_fence']}, "
               f"unparseable {stats['json_unparseable']} (likely cut off: {stats['json_likely_truncated']})"]
+    if generation:
+        header += _generation_header(generation)
     if stopped:
         header.append(f"- STOPPED EARLY: {stopped}")
     review_path = os.path.join(out_dir, "review.md")
     write_review(review_path, header, produced, log_path)
 
     print("\n=== Preview summary ===")
-    print(f"Examples      : " + ", ".join(f"{t} {counts[t]}/{args.count}" for t in _TASKS))
+    print(f"Examples      : " + ", ".join(f"{t} {counts[t]}/{requested[t]}" for t in _TASKS))
+    if generation:
+        for line in _generation_header(generation):
+            print("Mix           : " + line[2:])
     print(f"LLM calls     : {stats['calls']} (errors {stats['errors']}), avg {stats['avg_seconds']}s, "
           f"max {stats['max_seconds']}s, total run {elapsed}s")
     print(f"Responses     : think tag {stats['with_think_tag']} | empty {stats['empty_responses']} | "
@@ -327,6 +468,14 @@ def main():
     parser = argparse.ArgumentParser(description="Small-scale preview of the benchmark build.")
     parser.add_argument("--config", help="Preview config JSON (see configs/preview_*.json).")
     parser.add_argument("--count", type=int, default=2, help="Examples per task (default 2).")
+    parser.add_argument("--total-examples", type=int, metavar="N",
+                        help="Total examples over the selected tasks (split evenly, extra to the "
+                             "earlier tasks). Overrides --count.")
+    parser.add_argument("--tasks", help="Comma-separated subset of create,fix,modify (default all).")
+    parser.add_argument("--mode", choices=("standard", "complex", "mixed"),
+                        help="standard = all original-style, complex = all complex, mixed = use the ratios.")
+    parser.add_argument("--standard-ratio", type=float, help="Share of standard examples, e.g. 0.8.")
+    parser.add_argument("--complex-ratio", type=float, help="Share of complex examples, e.g. 0.2.")
     parser.add_argument("--out-dir", help="Output folder (default outputs/preview/<timestamp>).")
     parser.add_argument("--max-llm-calls", type=int, default=60,
                         help="Hard stop after this many model calls (default 60).")
