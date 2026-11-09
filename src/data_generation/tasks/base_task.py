@@ -24,7 +24,11 @@ class BaseDataTask:
 
         folder = os.path.join(os.getcwd(), "data", str(source), "test")
         if not os.path.isdir(folder):
-            raise ValueError(f"Dataset folder not found: {folder}")
+            hint = ""
+            if str(source) == "jsb_schemas":
+                hint = (" (data/jsb_schemas is git-ignored; recreate the exact original corpus with "
+                        "`python src/prepare_jsb_schemas.py`)")
+            raise ValueError(f"Dataset folder not found: {folder}{hint}")
 
         paths = [
             os.path.join(folder, f)

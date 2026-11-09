@@ -179,6 +179,11 @@ def main(argv=None):
                 "count_warnings": problems}
     with open(os.path.join(args.out_dir, "published_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+    from data_generation.anchor import write_anchor
+    anchor = write_anchor(args.out_dir)   # published_train_schemas.json: the pool of the "published_train" mode
+    manifest["anchor_pool"] = {"file": "published_train_schemas.json", **anchor["counts"], "anchor_sha256": anchor["anchor_sha256"]}
+    with open(os.path.join(args.out_dir, "published_manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
     print(json.dumps(manifest, indent=2))
     if overlap:
         print(f"WARNING: {len(overlap)} schemas appear in both published train and test.")

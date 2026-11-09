@@ -27,6 +27,8 @@ import random
 import re
 import threading
 
+from data_generation import chunking
+from data_generation.anchor import ANCHOR_FILENAME, AnchorError, load_anchor, select_pool
 from data_generation.complexity import (fix_metrics, meets_create_thresholds, modify_metrics,
                                         reference_metrics, schema_can_support, single_fix_metrics)
 from data_generation.fix_errors import inject_errors, verify_fix
@@ -55,6 +57,15 @@ def _looks_truncated(text):
     return body[:1] in "{[" and body[:1] != "" and not body.rstrip("` \n").endswith(("}", "]"))
 
 
+def _is_context_overflow(error):
+    return bool(getattr(error, "is_context_overflow", False))
+
+
+def _overflow_info(error):
+    return {"prompt_tokens": error.prompt_tokens, "max_tokens": error.max_tokens,
+            "max_model_len": error.max_model_len, "messages": error.n_messages}
+
+
 class _CountingLLM:
     """Delegates to a provider, counts the calls made through it, and reports problems.
 
@@ -80,7 +91,10 @@ class _CountingLLM:
             result = self.inner.generate(*args, **kwargs)
         except Exception as e:
             if self.sink:
-                self.sink("provider_error", f"{type(e).__name__}: {str(e)[:300]}")
+                # A request refused BEFORE sending because it cannot fit the context window is an expected capacity
+                # exclusion; every other provider error stays a (technical) provider_error.
+                kind = "context_overflow" if _is_context_overflow(e) else "provider_error"
+                self.sink(kind, f"{type(e).__name__}: {str(e)[:300]}")
             raise
         if self.sink:
             text = result[0] if isinstance(result, tuple) else result
@@ -145,6 +159,10 @@ class BenchmarkBuilder:
         if exclusions.get("file"):
             self.reserved_ids, self.reserved_hashes, self.reserved_info = load_reserved(exclusions["file"])
         self.reuse = ReuseSettings.from_config(config)
+        # Chunked full run (see data_generation/chunking.py): {"index", "n_chunks", "totals", "parent_dir", "config_sha256"}
+        self.chunk = config.get("chunk")
+        if self.chunk and not self.reuse:
+            raise ValueError("chunked generation needs the reuse block")
         self._published_refs, self._published_keys = {}, None
         if self.reuse:
             if not self.reserved_info:
@@ -495,6 +513,8 @@ class BenchmarkBuilder:
         """The ORIGINAL eligible training pool: the seed/ratio partition of all eligible schemas, train side,
         minus every schema whose id or content hash appears in the published TEST split, minus content
         duplicates inside the pool. Published train schemas stay in (they may be reused)."""
+        if self.reuse.pool_source == "published_train":
+            return self._anchored_pool()
         records = self._load_schema_records(apply_exclusions=False)
         partition = self._partition(records)
         train = sorted(partition["train"], key=lambda r: self._safe_id(r[1], r[2], r[3]))
@@ -544,6 +564,25 @@ class BenchmarkBuilder:
         self._pool_stats = {**(self._pool_stats or {}), **stats}
         return kept
 
+    def _anchor_path(self):
+        return self.reuse.anchor_file or os.path.join(os.path.dirname(os.path.abspath(self.reserved_info["file"])),
+                                                       ANCHOR_FILENAME)
+
+    def _anchored_pool(self):
+        """pool_source 'published_train': the schemas of the published TRAINING rows (ids, content and hashes as
+        published), minus those that overlap the published test set by id or content hash, minus the explicit size
+        restriction, minus content duplicates. Replaces only the reconstructed-pool compatibility check: instead of
+        "most published ids are in a rebuilt pool", the anchor must agree EXACTLY with reserved_schemas.json."""
+        try:
+            anchor = load_anchor(self._anchor_path(), self.reserved_info["file"])
+        except AnchorError as e:
+            raise ValueError(f"published_train pool refused: {e}") from None
+        kept, stats = select_pool(anchor, self.reuse.anchor_max_schema_kb, self.reuse.dedupe_pool_by_content)
+        stats["pool_source"] = "published_train"
+        stats["anchor_file"] = self._anchor_path()
+        self._pool_stats = {**(self._pool_stats or {}), **stats}
+        return [(e["schema"], e["source"], e["subset"], e["name"]) for e in kept]
+
     def reuse_capacity_report(self, assumed_acceptance=0.7):
         """Can the targets be met from the original training pool under the retry policy? (no model needed)"""
         pool = self._reuse_pool()
@@ -579,6 +618,60 @@ class BenchmarkBuilder:
             "note": "Balanced scheduling gives every schema its k-th new reference before any schema gets its (k+1)-th, "
                     "schemas with fewer published+new references first. The real acceptance rate of repeated attempts "
                     "is unknown until a smoke test; 'required_average_acceptance' is the assumption-free number."}
+
+    def _chunk_restore(self, ledger, dup, by_id):
+        """Continues the run from the verified parent chunk: the ledger (all per-schema limits) and the duplicate index."""
+        ch = self.chunk
+        problems = []
+        if ch["index"] < 1 or ch["index"] > ch["n_chunks"]:
+            problems.append("chunk index outside 1..n_chunks")
+        if not ch.get("parent_dir"):
+            if ch["index"] != 1:
+                problems.append("only chunk 1 may start without a parent chunk")
+            if problems:
+                raise ValueError("chunk refused: " + "; ".join(problems))
+            return
+        chain = chunking.load_chain(ch["parent_dir"])
+        first = chain[0][1]
+        if chain[-1][1]["chunk_index"] != ch["index"] - 1:
+            problems.append(f"parent is chunk {chain[-1][1]['chunk_index']}, expected {ch['index'] - 1}")
+        expect = {"anchor_sha256": (self._pool_stats or {}).get("anchor_sha256"), "pool_fingerprint": self._chunk_pool_fp,
+                  "config_sha256": ch["config_sha256"], "totals": ch["totals"], "n_chunks": ch["n_chunks"], "seed": self.seed}
+        for key, value in expect.items():
+            if first[key] != value:
+                problems.append(f"{key} differs from the parent chain")
+        if problems:
+            raise ValueError("chunk refused: " + "; ".join(problems))
+        chunking.restore_ledger(ledger, chain)
+        registered = 0
+        for cdir, state in chain:    # every earlier example is a known reference/content for duplicate control
+            for task in chunking.TASKS:
+                for name in state["files"][task]:
+                    with open(os.path.join(cdir, f"benchmark_{task}", "train", name), "r", encoding="utf-8") as f:
+                        rec = json.load(f)
+                    sid = name[:-5].rpartition("__a")[0]
+                    dup.register_reference(by_id[sid][4], reference_hash(task, rec), sid)
+                    dup.register_task(task, rec, sid)
+                    registered += 1
+        self._chunk_carried = {"parent_dir": ch["parent_dir"], "examples_registered": registered,
+                               "chain": [d for d, _ in chain]}
+
+    def chunk_state(self, out_dir, parent_state_sha=None, parent_dir_name=None):
+        """The state to checkpoint after a chunk that met its quota (called by build_benchmark.py)."""
+        st = getattr(self, "_reuse_state", None)
+        if not self.chunk or not st:
+            raise ValueError("no chunked reuse run to checkpoint")
+        ch = self.chunk
+        files = chunking.collect_files(out_dir)
+        return {
+            "chunk_index": ch["index"], "n_chunks": ch["n_chunks"], "totals": ch["totals"],
+            "quota": {t: self.counts_by_split["train"].get(t, 0) for t in self.base},
+            "anchor_sha256": (self._pool_stats or {}).get("anchor_sha256"),
+            "pool_fingerprint": self._chunk_pool_fp, "config_sha256": ch["config_sha256"], "seed": self.seed,
+            "parent": ({"dir": parent_dir_name, "state_sha256": parent_state_sha} if parent_dir_name else None),
+            "passes_end": st["passes"], "ledger": {sid: st["ledger"].entries[sid] for sid in st["ids"]},
+            "events": st["ledger"].events, "files": files,
+            "counts": {t: len(files[t]) for t in files}}
 
     def _reuse_scan_existing(self, split_dir, ledger, dup, by_id):
         """Resume: registers examples already on disk (references, contents, per-schema counts)."""
@@ -625,6 +718,9 @@ class BenchmarkBuilder:
         for sid in ids:
             ledger.entry(sid, by_id[sid][4])
         dup = DuplicateIndex(self._published_refs, self._published_keys)
+        self._chunk_pool_fp = chunking.pool_fingerprint(by_id)
+        if self.chunk:
+            self._chunk_restore(ledger, dup, by_id)
         have = self._reuse_scan_existing(split_dir, ledger, dup, by_id)
         had_before = dict(have)
         for k in self.base:
@@ -651,7 +747,8 @@ class BenchmarkBuilder:
             while ledger.live(ids):
                 pass_no += 1
                 state["passes"] = pass_no
-                order = ledger.order_for_pass(ids, pass_no, random.Random(f"{self.seed}-{split}-pass{pass_no}"))
+                order = ledger.order_for_pass(ids, pass_no, random.Random(f"{self.seed}-{split}-pass{pass_no}"
+                                                                                  + (f"-chunk{self.chunk['index']}" if self.chunk else "")))
                 for sid in order:
                     yield pass_no, sid
 
@@ -766,6 +863,10 @@ class BenchmarkBuilder:
                                 ref = result.get("reference_attempts") or {}
                                 why = ",".join(stages + list(dict.fromkeys(ref.get("reasons") or []))[:3])
                             event = ledger.finish_attempt(sid, accepted, pass_no, why)
+                            if result.get("schema_ineligible") and not accepted:
+                                # its own prompt cannot fit the window: no later attempt can differ
+                                event = ledger.retire(sid, "context_overflow: the schema's own prompt does not fit the "
+                                                           "model context window", pass_no) or event
                             if event:
                                 print(f"[{split}] schema {sid}: {event['event']}"
                                       + (f" ({event.get('reason')})" if event.get("reason") else ""))
@@ -863,6 +964,17 @@ class BenchmarkBuilder:
                 ref_info[mode] = info
             return refs[mode]
 
+        ineligible = []
+
+        def ref_fail(task, mode):
+            info = ref_info[mode]
+            if info.get("stage") == "context_overflow":
+                if info.get("permanent_context_overflow"):
+                    ineligible.append("context_overflow")
+                fail(task, "context_overflow", info)
+            else:
+                fail(task, "reference_failed", info)
+
         def base_meta(task, mode):
             inner = getattr(llm_provider, "inner", llm_provider)
             return {"task": task, "mode": mode, "schema_id": instance_id, "seed": seed_label,
@@ -873,10 +985,16 @@ class BenchmarkBuilder:
             mode = active["create"]
             reference = reference_for(mode)
             if reference is None:
-                fail("create", "reference_failed", ref_info[mode])
+                ref_fail("create", mode)
             else:
                 diag = {}
-                description = self._make_description(schema, reference, llm, gates, diag=diag)
+                try:
+                    description = self._make_description(schema, reference, llm, gates, diag=diag)
+                except Exception as e:
+                    if not _is_context_overflow(e):
+                        raise
+                    description = None
+                    diag.update(stage="context_overflow", context_overflow=_overflow_info(e))
                 descs[mode] = description
                 if description:
                     produced["create"] = {**tags, "description": description,
@@ -899,13 +1017,13 @@ class BenchmarkBuilder:
                         "string overlap)"]
                     meta["create"] = m
                 else:
-                    fail("create", "description_failed", diag)
+                    fail("create", "context_overflow" if diag.get("stage") == "context_overflow" else "description_failed", diag)
 
         if "fix" in active:
             mode = active["fix"]
             reference = reference_for(mode)
             if reference is None:
-                fail("fix", "reference_failed", ref_info[mode])
+                ref_fail("fix", mode)
             else:
                 fix_rng = random.Random(f"{seed_label}-fix")
                 erroneous, complexity_info, validation = None, None, None
@@ -937,8 +1055,16 @@ class BenchmarkBuilder:
                             complexity_info = fix_metrics(reference, erroneous, errors)
                             complexity_info["errors"] = errors
                             validation = check
+                overflow = False
                 if erroneous is not None:
-                    fix_desc = descs.get(mode) or self._describe(schema, reference, llm)
+                    try:
+                        fix_desc = descs.get(mode) or self._describe(schema, reference, llm)
+                    except Exception as e:
+                        if not _is_context_overflow(e):
+                            raise
+                        fail("fix", "context_overflow", _overflow_info(e))
+                        overflow, fix_desc = True, None
+                if erroneous is not None and not overflow:
                     record = {**tags, "erroneous_json": erroneous, "valid_json": reference}
                     if fix_desc:
                         record["description"] = fix_desc
@@ -954,13 +1080,19 @@ class BenchmarkBuilder:
             mode = active["modify"]
             reference = reference_for(mode)
             if reference is None:
-                fail("modify", "reference_failed", ref_info[mode])
+                ref_fail("modify", mode)
             else:
                 # Standard keeps the original rng stream; complex gets its own derived stream.
                 mod_rng = rng if mode == "standard" else random.Random(f"{seed_label}-modify")
                 diag = {}
-                mod = self._make_modification(schema, reference, llm, mod_rng, gates,
-                                              mode=mode, diag=diag)
+                try:
+                    mod = self._make_modification(schema, reference, llm, mod_rng, gates,
+                                                  mode=mode, diag=diag)
+                except Exception as e:
+                    if not _is_context_overflow(e):
+                        raise
+                    mod = None
+                    diag.update(stage="context_overflow", context_overflow=_overflow_info(e))
                 if mod is None:
                     fail("modify", diag.get("stage", "modification_failed"),
                          {k: v for k, v in diag.items() if k != "stage"})
@@ -980,7 +1112,8 @@ class BenchmarkBuilder:
             m["builder_llm_calls_for_schema"] = llm.calls
         return {"instance_id": instance_id, "produced": produced, "meta": meta,
                 "failures": failures, "llm_calls": llm.calls, "reference": refs.get("standard"),
-                "reference_attempts": ref_info.get("standard")}
+                "reference_attempts": ref_info.get("standard"),
+                "schema_ineligible": ineligible[0] if ineligible else None}
 
     # --------------------------------------------------------------- run report
 
@@ -1090,6 +1223,14 @@ class BenchmarkBuilder:
                            "note": "same content as an earlier example of this run (different "
                                    "schema); detection only - nothing is removed"},
             "failure_reasons": dict(sorted(failure_stages.items())),
+            "capacity_exclusions": {
+                "context_overflow": [
+                    {"schema_id": f.get("schema_id"), "task": f.get("task"),
+                     "detail": ((f.get("detail") or {}).get("context_overflow") if isinstance(f.get("detail"), dict)
+                                else f.get("detail"))}
+                    for f in failures_all if f.get("stage") == "context_overflow"],
+                "note": "requests that cannot fit the model context window; never sent, never retried, not provider "
+                        "errors (see src/llm/context_guard.py)"},
             "validation_check_failures": dict(sorted(check_failures.items())),
             "complexity": complexity,
             "builder_llm_calls": llm_calls,
@@ -1188,7 +1329,22 @@ class BenchmarkBuilder:
         for _ in range(gates["max_build_attempts"]):
             initial = self.task._build_schema_creation_prompt(schema, complexity_hint=True) \
                 if complexity_hint else self.task._build_schema_creation_prompt(schema)
-            result = self.task._run_fix_loop(schema, initial, llm_provider, self.max_retries)
+            try:
+                result = self.task._run_fix_loop(schema, initial, llm_provider, self.max_retries)
+            except Exception as e:
+                if not _is_context_overflow(e):
+                    raise
+                # The request was never sent. If it is the schema's own first prompt, every attempt would be
+                # identical, so stop at once and mark the schema as unusable; otherwise (a repair prompt that has
+                # grown too long) the next build attempt starts again from the original prompt.
+                reasons.append("context_overflow")
+                if diag is not None:
+                    diag["context_overflow"] = _overflow_info(e)
+                if e.n_messages == len(initial):
+                    if diag is not None:
+                        diag["permanent_context_overflow"] = True
+                    break
+                continue
             if result is None:
                 reasons.append("invalid_json_after_retries")
                 continue

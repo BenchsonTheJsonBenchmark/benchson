@@ -31,7 +31,15 @@ class ReuseSettings:
         "reject_cross_schema_duplicates": False,
         "dedupe_pool_by_content": True,
         "pool_sanity_min_fraction": 0.95,
+        # Where the schema pool comes from. "reconstructed" (default, unchanged) rebuilds the original partition from
+        # data/; "published_train" uses the schemas of the published training rows (see data_generation/anchor.py).
+        "pool_source": "reconstructed",
+        # published_train only: the anchor file (default: published_train_schemas.json next to the exclusions file)
+        "anchor_file": None,
+        # published_train only: the size restriction, an explicit experimental choice (REQUIRED in that mode; no default)
+        "anchor_max_schema_kb": None,
     }
+    POOL_SOURCES = ("reconstructed", "published_train")
 
     def __init__(self, **values):
         self.__dict__.update(self.DEFAULTS)
@@ -44,6 +52,15 @@ class ReuseSettings:
                 raise ValueError(f"reuse.{key} must be >= 1")
         if int(self.max_suspensions) < 0 or int(self.suspend_passes) < 0:
             raise ValueError("reuse.suspend_passes / max_suspensions must be >= 0")
+        if self.pool_source not in self.POOL_SOURCES:
+            raise ValueError(f"reuse.pool_source must be one of {self.POOL_SOURCES}, not {self.pool_source!r}")
+        if self.pool_source == "published_train":
+            kb = self.anchor_max_schema_kb
+            if isinstance(kb, bool) or not isinstance(kb, (int, float)) or kb <= 0:
+                raise ValueError("reuse.anchor_max_schema_kb is required (a positive number) with pool_source "
+                                 "'published_train': the size restriction is an explicit experimental choice")
+        elif self.anchor_file is not None or self.anchor_max_schema_kb is not None:
+            raise ValueError("reuse.anchor_file / anchor_max_schema_kb apply only to pool_source 'published_train'")
 
     @classmethod
     def from_config(cls, config):
@@ -126,6 +143,17 @@ class SchemaLedger:
             if event:
                 event["pass"] = pass_no
                 self.events.append(event)
+            return event
+
+    def retire(self, schema_id, reason, pass_no=None):
+        """Takes a schema out of the run for good (idempotent). Returns the event, or None if already retired."""
+        with self._lock:
+            e = self.entries[schema_id]
+            if e["status"] == "retired":
+                return None
+            e["status"], e["reason"] = "retired", reason
+            event = {"event": "retired", "schema_id": schema_id, "reason": reason, "pass": pass_no}
+            self.events.append(event)
             return event
 
     def order_for_pass(self, schema_ids, pass_no, rng):

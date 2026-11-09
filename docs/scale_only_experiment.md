@@ -163,3 +163,20 @@ suspected truncation (`generation_events.jsonl`, heuristic: JSON-looking answer 
 * Whether the installed vLLM version supports Granite 4 hybrid models must be checked. No model or quantization is substituted:
   if bf16 does not fit, an FP8/quantized variant is a decision for you, not made here.
 * Slurm needs: GPU partition/type, time limit, large writable HF cache, internet or pre-downloaded weights (compute nodes are often offline), a vLLM env.
+
+## 7. Protocol: published-baseline anchored pool (approved 2026-11-08)
+
+Section 6 stated that the pool was "reconstructed exactly". That is true for the FIRST build (git `e7f8b22`: 950 Create-train examples, 250/1419
+partition) but not for the published Hugging Face snapshot, which has 1000 Create-train examples and train schemas that do not line up with that
+partition. The scale-only run therefore samples from the schemas of the published training rows (`reuse.pool_source: "published_train"`,
+see `docs/schema_reuse.md`). Preparation on a machine that has `data_published/<sha12>/`:
+
+    python src/export_anchor_pool.py --baseline-dir data_published/7962b0947f7d
+
+### What this experiment does and does not isolate (state this when reporting results)
+Scale-only changes TWO things relative to the published data, so it does **not** isolate dataset quantity under otherwise identical generation conditions:
+1. **Generator model**: IBM Granite 4.0 H-Small instead of `openai/gpt-oss-120b` (the prompts still contain the gpt-oss-specific `Reasoning: low/high` lines).
+2. **Sampling policy**: controlled schema reuse (up to `max_new_references_per_schema` independent, deduplicated examples per schema) instead of one example per schema.
+Further caveats: the pool is limited to schemas that already occur in the published train set (schema diversity does not grow), a documented 10 KB size
+restriction removes larger schemas (the published train set contains some), temperature 0.7 / max tokens 4096 / top_p 0.95 are provisional,
+and the published train and test sets already share some schema content (reported by the importer).

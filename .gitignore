@@ -196,3 +196,7 @@ data_scale_only/
 data_scale_7k/
 hf_export_7k/
 release/
+
+# Generated experiment data and Slurm logs
+data_scale_only/
+logs/

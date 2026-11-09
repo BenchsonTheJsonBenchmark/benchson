@@ -82,6 +82,16 @@ def validate_scale_only(config):
                 problems.append("max_schema_kb must stay 10")
         if not config.get("reuse", {}).get("max_new_references_per_schema"):
             problems.append("reuse.max_new_references_per_schema is required (per-schema cap)")
+        reuse_cfg = config.get("reuse", {})
+        if reuse_cfg.get("pool_source") == "published_train":
+            # Pool = schemas of the published training rows. The size restriction is an explicit experimental choice
+            # (kept at 10 KB), not a claim about how the Hugging Face snapshot was generated.
+            if reuse_cfg.get("anchor_max_schema_kb") != 10:
+                problems.append("reuse.anchor_max_schema_kb must be 10 (documented experimental restriction)")
+            anchor = reuse_cfg.get("anchor_file") or (os.path.join(os.path.dirname(os.path.abspath(excl)), "published_train_schemas.json")
+                                                     if excl else None)
+            if anchor and not os.path.isfile(anchor):
+                problems.append(f"anchor file not found: {anchor} (python src/export_anchor_pool.py --baseline-dir <baseline>)")
     else:
         problems.append("missing 'reuse' block (the scale-only experiment samples several examples per schema)")
     return problems
@@ -113,10 +123,43 @@ def main(argv=None):
     parser.add_argument("--assumed-acceptance", type=float, default=0.5,
                         help="Used by --check-pool: fraction of schemas assumed to yield an accepted example.")
     parser.add_argument("--smoke-total", type=int, default=None, help="Build only N examples in total.")
+    parser.add_argument("--smoke-openai-timeout", type=int,
+                        help="For an OpenAI smoke run, set the SDK timeout in seconds and disable SDK retries.")
     parser.add_argument("--out-dir", default=None, help="Override output_root.")
     parser.add_argument("--max-llm-calls", type=int, default=None)
     parser.add_argument("--record-calls", default=None)
+    parser.add_argument("--context-guard", type=int, default=None, metavar="MAX_MODEL_LEN",
+                        help="Refuse (without sending) any request with prompt_tokens + max_tokens > MAX_MODEL_LEN, "
+                             "counted by the vLLM server's own tokenizer. MAX_MODEL_LEN must equal the server's "
+                             "--max-model-len. Nothing else about a request changes.")
+    parser.add_argument("--chunks", type=int, default=None, metavar="N",
+                        help="Full run in N chunks: this job builds chunk --chunk-index, whose per-task quota is "
+                             "floor(total*k/N)-floor(total*(k-1)/N) of the config counts (exact sums). Needs --out-dir.")
+    parser.add_argument("--chunk-index", type=int, default=None, metavar="K")
+    parser.add_argument("--parent-chunk", default=None,
+                        help="Directory of the previous, validated chunk (required for K > 1; never inferred).")
     args = parser.parse_args(argv)
+
+    if args.chunks is not None:
+        if args.smoke_total is not None or not args.out_dir or args.chunk_index is None:
+            parser.error("--chunks needs --chunk-index and --out-dir, and cannot be combined with --smoke-total")
+        if args.chunk_index > 1 and not args.parent_chunk:
+            parser.error("--parent-chunk is required for --chunk-index > 1 (explicit, validated recovery; never automatic)")
+        if args.chunk_index == 1 and args.parent_chunk:
+            parser.error("chunk 1 has no parent")
+        if os.path.lexists(args.out_dir):
+            parser.error(f"chunk output directory already exists: {args.out_dir} (never reused or overwritten)")
+        if args.parent_chunk:   # refuse a missing, incomplete or tampered parent BEFORE anything is created
+            from data_generation import chunking
+            try:
+                chunking.load_chain(args.parent_chunk)
+            except chunking.ChunkError as e:
+                parser.error(f"parent chunk refused: {e}")
+    elif args.chunk_index is not None or args.parent_chunk:
+        parser.error("--chunk-index / --parent-chunk need --chunks")
+
+    if args.smoke_openai_timeout is not None and ((not args.smoke_total and args.chunks is None) or args.smoke_openai_timeout <= 0):
+        parser.error("--smoke-openai-timeout requires a positive timeout and --smoke-total (or --chunks)")
 
     if args.env_file:
         loaded = load_env_file(args.env_file)
@@ -141,11 +184,26 @@ def main(argv=None):
         if not args.out_dir and config.get("output_root"):
             config["output_root"] = config["output_root"].rstrip("/") + "_smoke"
 
+    if args.chunks is not None:
+        from data_generation import chunking
+        totals = dict((config.get("counts") or {}).get("train") or {})
+        if set(totals) != set(chunking.TASKS):
+            parser.error("--chunks needs counts.train for create, fix and modify in the config")
+        try:
+            quota = chunking.increments(totals, args.chunks, args.chunk_index)
+        except chunking.ChunkError as e:
+            parser.error(str(e))
+        config["counts"] = {"train": quota}
+        config["chunk"] = {"index": args.chunk_index, "n_chunks": args.chunks, "totals": totals,
+                           "parent_dir": os.path.abspath(args.parent_chunk) if args.parent_chunk else None,
+                           "config_sha256": hashlib.sha256(config_bytes).hexdigest()}
+
     if raw.get("scale_only"):
         problems = validate_scale_only(config)
         if problems:
             sys.exit("scale_only safety check failed:\n  - " + "\n  - ".join(problems))
-        print("[scale_only] safety checks passed (standard-only, original Modify, exclusions, reuse settings, separate output).")
+        print("[scale_only] safety checks passed (standard-only, original Modify, exclusions, reuse settings, separate output).",
+              file=sys.stderr if args.check_pool else sys.stdout)
 
     if args.check_pool:
         probe = {k: v for k, v in config.items() if k not in ("llm_provider", "validator_provider")}
@@ -166,6 +224,11 @@ def main(argv=None):
         return report
 
     config = expand_env(config)
+    if args.smoke_openai_timeout is not None:
+        provider = config["llm_provider"]
+        if (provider["module"], provider["class"]) != ("src.llm.openai.openai_provider", "OpenAIProvider"):
+            parser.error("--smoke-openai-timeout requires OpenAIProvider")
+        provider.setdefault("params", {}).update(timeout=args.smoke_openai_timeout, max_retries=0)
     llm_provider = LLMProvider.from_config(config["llm_provider"])
     validator_provider = None
     if "validator_provider" in config:
@@ -180,6 +243,17 @@ def main(argv=None):
         if validator_provider is not None:
             validator_provider = RecordingProvider(validator_provider, log_path, "validator", budget)
 
+    guard = None
+    if args.context_guard is not None:
+        from llm.context_guard import ContextGuardProvider
+        raw_provider = llm_provider   # the guard counts with the real provider and sits OUTSIDE the call recorder
+        if not hasattr(getattr(raw_provider, "inner", raw_provider), "count_prompt_tokens"):
+            parser.error("--context-guard needs a provider with count_prompt_tokens (OpenAIProvider on vLLM)")
+        counter = getattr(raw_provider, "inner", raw_provider)
+        max_tokens = ((config["llm_provider"].get("params") or {}).get("model_params") or {}).get("max_tokens")
+        guard = ContextGuardProvider(llm_provider, counter, args.context_guard, max_tokens)
+        llm_provider = guard
+
     builder = BenchmarkBuilder(config)
     out_root = builder.data_root
     os.makedirs(out_root, exist_ok=True)
@@ -193,9 +267,13 @@ def main(argv=None):
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "config": _redacted(raw),
         "smoke_total": args.smoke_total,
+        "chunk": config.get("chunk"),
+        "chunk_quota": config["counts"]["train"] if args.chunks is not None else None,
         "seed": builder.seed,
         "model": model_params.get("model"),
         "model_params": model_params.get("model_params"),
+        **({"smoke_openai_sdk": {"timeout": args.smoke_openai_timeout, "max_retries": 0}}
+           if args.smoke_openai_timeout is not None else {}),
         "counts": builder.counts_by_split,
         "generation_mode": {"standard_ratio": str(builder.settings.standard_ratio),
                             "complex_ratio": str(builder.settings.complex_ratio),
@@ -208,6 +286,7 @@ def main(argv=None):
         "host": platform.node(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "max_llm_calls": args.max_llm_calls,
+        "context_guard": guard.stats if guard else {"enabled": False},
         "schema_reuse": builder.reuse.as_dict() if builder.reuse else None,
         "policy_note": ("Changes the original one-example-per-schema sampling policy (controlled schema reuse); "
                         "keeps the original generation logic, prompts, thresholds and schema pool. The generator "
@@ -225,6 +304,20 @@ def main(argv=None):
         manifest["llm_calls_used"] = budget.used if budget else None
         manifest["run_summary"] = builder.last_summary
         _write_manifest(manifest_path, manifest)
+
+    if args.chunks is not None:
+        # Checkpoint only a chunk that met its quota exactly; anything else stays as inspectable, unusable output.
+        from data_generation import chunking
+        got = {t: len(f) for t, f in chunking.collect_files(out_root).items()}
+        if got != config["counts"]["train"]:
+            print(f"[chunk] quota not met: produced {got}, expected {config['counts']['train']}; no checkpoint written",
+                  file=sys.stderr)
+            sys.exit(2)
+        parent = config["chunk"]["parent_dir"]
+        state = builder.chunk_state(out_root, chunking.load_state(parent)["self_sha256"] if parent else None,
+                                    os.path.basename(parent) if parent else None)
+        chunking.write_state(out_root, state)
+        print(f"[chunk] checkpoint written: chunk {args.chunk_index}/{args.chunks}, {got}")
 
 
 if __name__ == "__main__":

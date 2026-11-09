@@ -1,5 +1,11 @@
 # Original Benchson v2 generation settings: confirmed vs unknown
 
+> **Correction (2026-11-08).** The "Confirmed" table below comes from the git manifests of commit `e7f8b22` (the FIRST build, 2026-06-15). The published
+> Hugging Face snapshot (`7962b09…`, 2026-06-29, commit `8f321fa` mentions "hardened-corpus configs", which are git-ignored and not in the repository) was
+> built differently: of its 1269 train schema ids only 771 are in the pool reconstructed from `data/`. Its max_schema_kb, partition, seed and corpus are
+> therefore UNKNOWN. Builder model and round-trip validator model are stated by the dataset card; the rest of the table is verified for `e7f8b22` only.
+> The scale-only run no longer relies on these values to define its pool (see `docs/schema_reuse.md`, pool source `published_train`).
+
 Sources: published manifests in git `e7f8b22:data/benchmark_*/manifest.json` (build of 2026-06-15), the
 Hugging Face dataset card of `aviv1ron1/Benchson` @ `7962b0947f7d96eb3a0e6b9b928d939c7f3061a6`
 (read via the HF API on 2026-11-04), `BENCHMARK.md`, and the builder code at `e7f8b22` (identical defaults on this branch).
