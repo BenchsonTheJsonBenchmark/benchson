@@ -9,7 +9,8 @@
 # Every link is `sbatch --dependency=afterok:<previous> --kill-on-invalid-dep=yes` of slurm/full_chunk_chain_job.sbatch. A failed,
 # cancelled or timed-out link therefore cancels everything behind it, and each link additionally validates its parent chunk itself
 # (success marker, hash chain, totals, cap, duplicates, leakage) before doing any work. Job IDs are recorded in
-# logs/full-chain-<after>-c<from>-c<to>.jobs (created once, never overwritten).
+# logs/full-chain-<after>-c<from>-c<to>-<UTC time>.jobs (a new file per submission, never overwritten; records of cancelled
+# earlier chains do not block a new submission -- duplicates are prevented by the queue check below and by the jobs themselves).
 set -uo pipefail
 umask 077
 die() { echo "REFUSED: $*" >&2; exit 10; }
@@ -60,8 +61,8 @@ done
 [ "$DO_SUBMIT" -eq 1 ] || { echo "Dry run only. Add --submit to submit."; exit 0; }
 
 mkdir -p logs || die "cannot create logs/"
-RECORD="logs/full-chain-${AFTER}-c$(printf '%02d' "$FROM")-c$(printf '%02d' "$TO").jobs"
-( set -o noclobber; : > "$RECORD" ) 2>/dev/null || die "$RECORD already exists: this chain was submitted before (check squeue/sacct)"
+RECORD="logs/full-chain-${AFTER}-c$(printf '%02d' "$FROM")-c$(printf '%02d' "$TO")-$(date -u +%Y%m%dT%H%M%SZ).jobs"
+( set -o noclobber; : > "$RECORD" ) 2>/dev/null || die "$RECORD already exists (submitted again within the same second?)"
 PREV="$AFTER"
 for K in $(seq "$FROM" "$TO"); do
     ARGS=(--parsable --kill-on-invalid-dep=yes "--job-name=benchson-full-c$(printf '%02d' "$K")" "--export=ALL,CHUNK_INDEX=$K")

@@ -38,6 +38,8 @@ class OpenAIProvider(LLMProvider):
         # builder records an 'empty_response' event instead of crashing on None.
         return response.choices[0].message.content or ""
 
+    COUNT_TIMEOUT_SECONDS = 60   # the /tokenize request only; the model-generation timeout and retries are separate and unchanged
+
     def count_prompt_tokens(self, messages):
         """Exact prompt length from the vLLM server's own tokenizer and chat template (POST <root>/tokenize).
 
@@ -58,6 +60,6 @@ class OpenAIProvider(LLMProvider):
             "Content-Type": "application/json", "Authorization": f"Bearer {self.client.api_key}"})
         loopback = urllib.parse.urlparse(root).hostname in ("127.0.0.1", "localhost", "::1")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if loopback else urllib.request.build_opener()
-        with opener.open(request, timeout=30) as response:
+        with opener.open(request, timeout=self.COUNT_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read().decode("utf-8"))
         return int(answer["count"]), answer.get("max_model_len")

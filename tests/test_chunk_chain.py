@@ -241,6 +241,10 @@ esac
         return subprocess.run(["bash", os.path.join(self.co, "slurm", "submit_chunk_chain.sh"), *args], cwd=self.tmp.name, env=e,
                               capture_output=True, text=True, timeout=60)
 
+    def records(self):
+        d = os.path.join(self.co, "logs")
+        return sorted(os.path.join(d, n) for n in os.listdir(d) if n.startswith("full-chain-")) if os.path.isdir(d) else []
+
     def calls(self):
         p = os.path.join(self.state, "sbatch_calls")
         return read(p).splitlines() if os.path.exists(p) else []
@@ -259,9 +263,19 @@ esac
             self.assertIn(f"--job-name=benchson-full-c{k:02d}", call); self.assertIn(f"--export=ALL,CHUNK_INDEX={k}", call)
             self.assertIn("slurm/full_chunk_chain_job.sbatch", call); self.assertIn("|PARENT_CHUNK=unset|PIN=unset", call)   # no leaks
             self.assertEqual(call.count("--dependency"), 1)
-        rec = read(os.path.join(self.co, "logs", "full-chain-24044333-c02-c08.jobs")); self.assertEqual(len(rec.splitlines()), 7)
-        again = self.run_sub("--after", "24044333", "--submit")                       # never twice, never overwriting the record
-        self.assertEqual(again.returncode, 10); self.assertEqual(len(self.calls()), 7); self.assertEqual(read(os.path.join(self.co, "logs", "full-chain-24044333-c02-c08.jobs")), rec)
+        records = self.records(); self.assertEqual(len(records), 1); rec = read(records[0]); self.assertEqual(len(rec.splitlines()), 7)
+        # still queued: a second submission of the same chunks is refused (the queue, not an old record file, prevents duplicates)
+        again = self.run_sub("--after", "24044333", "--submit", SQ_NAMES="\n".join(f"benchson-full-c{k:02d}" for k in range(2, 9)))
+        self.assertEqual(again.returncode, 10); self.assertEqual(len(self.calls()), 7); self.assertEqual(read(records[0]), rec)
+
+    def test_records_of_cancelled_earlier_chains_never_block_a_new_submission(self):
+        os.makedirs(os.path.join(self.co, "logs"))
+        for name in ("full-chain-24044333-c02-c08.jobs", "full-chain-none-c02-c08-20261109T000000Z.jobs"):
+            open(os.path.join(self.co, "logs", name), "w").write("chunk 2 job=24044864 after=24044333\n")   # the cancelled chain of 2026-11-09
+        r = self.run_sub("--after", "none", "--from", "2", "--submit", SQ_JOB_LINE="")        # nothing of it is queued any more
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertEqual(len(self.calls()), 7); self.assertNotIn("--dependency", self.calls()[0])
+        self.assertEqual(len(self.records()), 3)                                                # a NEW record; the old ones are untouched
+        self.assertEqual(read(os.path.join(self.co, "logs", "full-chain-24044333-c02-c08.jobs")), "chunk 2 job=24044864 after=24044333\n")
 
     def test_previous_job_must_be_an_active_benchson_chunk_job(self):
         for line in ("", "24044333|other-job|RUNNING", "24044333|benchson-full|SUSPENDED", "24044333|benchson-full|FAILED", "999|benchson-full|RUNNING"):
@@ -278,7 +292,7 @@ esac
     def test_sbatch_failure_stops_the_chain_and_keeps_what_was_submitted(self):
         r = self.run_sub("--after", "24044333", "--submit", SBATCH_FAIL_AT=3)
         self.assertEqual(r.returncode, 11); self.assertEqual(len(self.calls()), 3)
-        self.assertEqual(len(read(os.path.join(self.co, "logs", "full-chain-24044333-c02-c08.jobs")).splitlines()), 2)
+        self.assertEqual(len(read(self.records()[0]).splitlines()), 2)
         self.assertIn("chain stops", r.stderr)
 
     def test_continuing_without_a_dependency_after_a_manually_verified_chunk(self):

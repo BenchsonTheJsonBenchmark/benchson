@@ -6,6 +6,9 @@
     python src/chunked_run.py validate CHUNK_DIR --anchor-file ANCHOR [--calls-log LOG --build-exit-code N]
     python src/chunked_run.py seal     CHUNK_DIR --anchor-file ANCHOR --calls-log LOG --build-exit-code 0
     python src/chunked_run.py resolve  --root ROOT --index K --anchor-file ANCHOR --reserved-file RESERVED --chunks 8 --totals ... [--pin NAME]
+    python src/chunked_run.py selfcheck | fingerprint
+    python src/chunked_run.py recover-seal CHUNK_DIR --anchor-file A --reserved-file R --calls-log L --slurm-log S --config-file C \
+        --require-context-guard 8192 --confirm-recovery CHUNK_DIR_NAME      (one-time, explicit; see docs/overnight_chunk_chain.md)
     python src/chunked_run.py merge    --root ROOT --chain c01_x ... c08_z --anchor-file ANCHOR --out-dir NEW_DIR
 
 Rules: nothing is chosen, repaired or merged automatically. The chain to continue from or to merge is always given
@@ -16,6 +19,7 @@ Exit codes: 0 ok, 2 shortfall, 3 technical, 4 invalid (same as the smoke/pilot c
 index (its directory name is printed), 6 none, 7 ambiguous (more than one) -- never a guess.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,12 +48,89 @@ def _manifest(chunk_dir):
         return json.load(f)
 
 
+# One-time, hard-coded exception for ONE historical chunk (see docs/overnight_chunk_chain.md, "Historical token-count timeouts").
+# It excuses exactly three attempts of exactly one chunk and nothing else; it is not a general TimeoutError exemption.
+HISTORICAL_POLICY = {
+    "policy": "historical-token-count-timeouts/1",
+    "chunk": "c01_24044333-r1",
+    "ids": ("schemas__sarif-external-property-file-2.1.0-rtm.3__a1", "schemas__jsonld__a1",
+            "schemas__sarif-external-property-file-2.1.0-rtm.0__a1"),
+    "event_detail": "TimeoutError: timed out",      # the provider_error event of each attempt (one per attempt)
+    "failure_detail": "timed out",                   # the worker_error failure of each needed task (three per attempt)
+}
+HISTORICAL_ORIGIN_NOTE = ("origin_status: inferred_not_proven. No traceback was saved. The timeouts are inferred to come from "
+                          "the /tokenize token count (30 s, outside the call recorder, hence absent from the calls log) because "
+                          "no model call failed; this is consistent with, but not proven by, the evidence.")
+
+
+def historical_spec():
+    return {**HISTORICAL_POLICY, "ids": tuple(HISTORICAL_POLICY["ids"])}
+
+
+def historical_authorization_problems(chunk_name, policy, ids):
+    """The explicit authorization must name this policy and EXACTLY the three historical attempt ids of the one chunk."""
+    problems = []
+    if policy != HISTORICAL_POLICY["policy"]:
+        problems.append(f"authorization names policy {policy!r}, not {HISTORICAL_POLICY['policy']!r}")
+    if chunk_name != HISTORICAL_POLICY["chunk"]:
+        problems.append(f"the historical policy applies only to chunk {HISTORICAL_POLICY['chunk']}, not {chunk_name}")
+    given = list(ids or [])
+    if len(given) != len(set(given)) or sorted(given) != sorted(HISTORICAL_POLICY["ids"]):
+        problems.append(f"the attempt ids must be exactly {sorted(HISTORICAL_POLICY['ids'])}; got {sorted(given)}")
+    return problems
+
+
+def _historical_from_seal(chunk_dir, state):
+    """(spec or None, problems): the tolerance a VERIFIED success marker records, only for the hard-coded chunk and ids."""
+    path = os.path.join(chunk_dir, chunking.SEAL_FILE)
+    if not os.path.isfile(path):
+        return None, []
+    try:
+        seal = chunking.load_seal(chunk_dir, state)
+    except (chunking.ChunkError, OSError, ValueError):
+        return None, []   # an unverifiable marker grants nothing (and the chain check reports it)
+    tol = (seal.get("recovery") or {}).get("historical_tolerance") if isinstance(seal.get("recovery"), dict) else None
+    if tol is None:
+        return None, []
+    bad = historical_authorization_problems(os.path.basename(chunk_dir), tol.get("policy"), tol.get("ids"))
+    if bad:
+        return None, ["success marker records an unknown or inapplicable historical tolerance: " + "; ".join(bad)]
+    return historical_spec(), []
+
+
+def historical_state_problems(chunk_dir, state, spec):
+    """What the historical exception requires of the saved state: no example/sidecar for the three attempts, and the ledger
+    still counts every one of them as a failed attempt."""
+    problems = []
+    for aid in spec["ids"]:
+        sid = aid.rpartition("__a")[0]
+        for task in TASKS:
+            for rel in (os.path.join(f"benchmark_{task}", "train", aid + ".json"),
+                        os.path.join(f"benchmark_{task}", "_metadata", "train", aid + ".json")):
+                if os.path.exists(os.path.join(chunk_dir, rel)):
+                    problems.append(f"{rel} exists although attempt {aid} failed")
+            if aid + ".json" in state["files"][task]:
+                problems.append(f"the saved state lists an example for failed attempt {aid}")
+        row = state["ledger"].get(sid)
+        if not isinstance(row, dict):
+            problems.append(f"schema ledger has no row for {sid}")
+        elif not (isinstance(row.get("failed_attempts"), int) and row["failed_attempts"] >= 1
+                  and isinstance(row.get("attempts"), int)
+                  and row["attempts"] >= row.get("accepted_references", 0) + row["failed_attempts"]):
+            problems.append(f"schema ledger row of {sid} does not count the failed attempt {aid} "
+                            f"(attempts={row.get('attempts')}, failed_attempts={row.get('failed_attempts')}, "
+                            f"accepted_references={row.get('accepted_references')})")
+    return problems
+
+
 def validate_chunk(chunk_dir, anchor_file, reserved_file=None, calls_log=None, build_exit_code=None,
-                   require_context_guard=None, seal="all"):
+                   require_context_guard=None, seal="all", historical=None):
     """Full validation of a chunk AND of every chunk before it. Returns the checker-style result dict.
 
     seal="all" (default): every chunk of the chain, this one included, must carry a valid success marker.
-    seal="ancestors": only the chunks before this one (used by `seal`, before this chunk's own marker exists)."""
+    seal="ancestors": only the chunks before this one (used by `seal`, before this chunk's own marker exists).
+    historical: None (strict) or historical_spec() - only `recover-seal` passes it, before the marker exists. Afterwards the
+    tolerance is derived from the VERIFIED marker of the one hard-coded chunk, never from a caller."""
     technical, invalid, shortfall, warnings = [], [], [], []
     if build_exit_code == 2:   # build_benchmark.py's own code for "quota not met": a shortfall, with no checkpoint written
         counts = {t: len(f) for t, f in chunking.collect_files(chunk_dir).items()}
@@ -60,8 +141,16 @@ def validate_chunk(chunk_dir, anchor_file, reserved_file=None, calls_log=None, b
     except (chunking.ChunkError, OSError) as e:
         return csr._result({t: 0 for t in TASKS}, [f"chunk chain: {e}"], [], [], [])
     last_dir, last = chain[-1]
+    if historical is None:
+        historical, marker_problems = _historical_from_seal(last_dir, last)
+        technical += marker_problems
+    elif historical != historical_spec() or os.path.basename(last_dir) != HISTORICAL_POLICY["chunk"]:
+        return csr._result({t: 0 for t in TASKS}, ["historical tolerance refused: not the hard-coded policy for its chunk"],
+                           [], [], [])
     base = csr.check(last_dir, per_task=last["quota"], calls_log=calls_log, build_exit_code=build_exit_code,
-                     anchor_file=anchor_file)
+                     anchor_file=anchor_file, tolerate_historical=historical)
+    if historical:
+        technical += historical_state_problems(last_dir, last, historical)
     technical += base["technical"]; invalid += base["invalid"]; shortfall += base["shortfall"]; warnings += base["warnings"]
     counts = dict(base["counts"])
 
@@ -141,7 +230,7 @@ def validate_chunk(chunk_dir, anchor_file, reserved_file=None, calls_log=None, b
     for t in TASKS:
         if cum[t] != totals[t] * k // n:
             invalid.append(f"{t}: cumulative {cum[t]} after chunk {k}, expected {totals[t] * k // n}")
-    res = csr._result(counts, technical, invalid, shortfall, warnings)
+    res = csr._result(counts, technical, invalid, shortfall, warnings, base.get("tolerated"))
     res["chain"] = [os.path.basename(d) for d, _ in chain]
     res["cumulative"] = cum
     res["chunk_index"], res["n_chunks"] = k, n
@@ -243,6 +332,175 @@ def resolve_chunk(root, index, anchor_file, reserved_file, n_chunks, totals, pin
     return 0, valid[0], valid, ignored
 
 
+RUNTIME_FILES = ("src/build_benchmark.py", "src/check_smoke_result.py", "src/chunked_run.py", "src/pilot_report.py",
+                 "src/data_generation/anchor.py", "src/data_generation/benchmark_builder.py", "src/data_generation/chunking.py",
+                 "src/data_generation/published.py", "src/data_generation/reuse.py", "src/data_generation/tasks/base_task.py",
+                 "src/llm/context_guard.py", "src/llm/openai/openai_provider.py", "src/llm/recording_provider.py",
+                 "configs/scale_only_vllm_granite.json", "slurm/full_chunk_granite_v2.sbatch",
+                 "slurm/full_chunk_chain_job.sbatch", "slurm/submit_chunk_chain.sh")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def fingerprint():
+    """{relative path: sha256 or None} of the files a run depends on: compare it with the reviewed checkout to catch drift."""
+    out = {}
+    for rel in RUNTIME_FILES:
+        path = os.path.join(REPO_ROOT, rel)
+        out[rel] = chunking.file_sha256(path) if os.path.isfile(path) else None
+    return out
+
+
+def selfcheck():
+    """Deployment self-test (CPU only, writes only into a private temp dir): the checker and the report tool of THIS checkout must
+    understand the per-task quotas that chunk runs use. A stale copy of either one failed the first full chunk after its
+    generation finished, so the chunk script runs this before any GPU time is used. Returns a list of problems."""
+    import contextlib
+    import io
+    import tempfile
+    import pilot_report
+    problems = []
+    quota = {t: 1 for t in TASKS}
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            res = csr.check(tmp, per_task=quota)
+            if not isinstance(res, dict) or "code" not in res:
+                problems.append("check_smoke_result.check returned an unexpected result")
+        except Exception as e:
+            problems.append(f"check_smoke_result.check cannot handle per-task quotas: {type(e).__name__}: {e}")
+        try:
+            pilot_report.build_report(tmp, None, quota)
+            target = os.path.join(tmp, "report.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = pilot_report.main(["--out-dir", tmp, "--targets", "create=1,fix=1,modify=1", "--build-exit-code", "0",
+                                          "--check-exit-code", "0", "--gen-start-epoch", "1", "--gen-end-epoch", "2",
+                                          "--max-llm-calls", "1", "--write", target])
+            if not os.path.isfile(target):
+                problems.append(f"pilot_report.py wrote no report (exit {code})")
+        except BaseException as e:   # argparse errors are SystemExit
+            problems.append(f"pilot_report.py does not accept the chunk arguments: {type(e).__name__}: {e}")
+    return problems
+
+
+def recover_seal(chunk_dir, anchor_file, reserved_file, calls_log, slurm_log, config_file, require_context_guard, confirm,
+                 historical_policy=None, historical_ids=None):
+    """One-time, explicit recovery of a chunk that finished generating (state written) but was never sealed because the final
+    validation step itself crashed. Nothing is regenerated, edited or replaced: every normal validation runs again, the ORIGINAL calls
+    log must be the one this build wrote, and only if all of it passes is the normal success marker written (it carries a
+    `recovery` record of the evidence). Fails closed whenever evidence is missing.
+
+    historical_policy / historical_ids: the explicit authorization of the one-time historical exception (HISTORICAL_POLICY). Both
+    must be given, must equal the hard-coded policy id and the three exact attempt ids, and the chunk must be the hard-coded one.
+    Without them the normal strict checker is used and a chunk with technical errors is refused."""
+    chunk_dir = os.path.abspath(chunk_dir)
+    name = os.path.basename(chunk_dir)
+    fail = lambda *msgs: csr._result({t: 0 for t in TASKS}, ["not recovered: " + m for m in msgs], [], [], [])
+    m = CHUNK_DIR_RE.match(name)
+    if not m:
+        return fail(f"{name!r} is not a chunk directory name (c<NN>_<job>-r<attempt>)")
+    index, job, attempt = int(m.group(1)), m.group(2), m.group(3)
+    run_id = f"{job}-r{attempt}"
+    if confirm != name:
+        return fail(f"--confirm-recovery must repeat the directory name exactly ({name})")
+    spec = None
+    if historical_policy is not None or historical_ids is not None:
+        bad = historical_authorization_problems(name, historical_policy, historical_ids)
+        if bad:
+            return fail(*bad)
+        spec = historical_spec()
+    if os.path.lexists(os.path.join(chunk_dir, chunking.SEAL_FILE)):
+        return fail("a success marker already exists; it is never replaced")
+    if os.path.basename(calls_log or "") != f"{name}_calls.jsonl" or not os.path.isfile(calls_log):
+        return fail(f"the original calls log {name}_calls.jsonl of this build is required")
+    if not slurm_log or not os.path.isfile(slurm_log):
+        return fail("the Slurm log of the original job is required as evidence of the build's exit code")
+    problems = []
+    try:
+        state = chunking.load_state(chunk_dir)
+        chunking.verify_files(chunk_dir, state)
+        manifest = _manifest(chunk_dir)
+    except (chunking.ChunkError, OSError, ValueError) as e:
+        return fail(f"state or manifest unusable: {e}")
+    # (1) the build process finished normally: manifest, then state (written only after the builder returned and the quota was met)
+    if manifest.get("status") != "completed" or not manifest.get("finished"):
+        problems.append(f"manifest status is {manifest.get('status')!r}, not a completed build")
+    if str(manifest.get("slurm_job_id")) != job:
+        problems.append(f"manifest belongs to Slurm job {manifest.get('slurm_job_id')!r}, not {job}")
+    if (manifest.get("chunk") or {}).get("index") != index or state["chunk_index"] != index:
+        problems.append("chunk index differs between directory name, manifest and state")
+    # (2) the build's exit code, read from this attempt's segment of the (append-mode) Slurm log
+    segment, inside = [], False
+    with open(slurm_log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("=== Preflight"):
+                inside = f"run={run_id} " in line + " "
+            if inside:
+                segment.append(line.rstrip("\n"))
+    codes = [re.match(r"^build_benchmark\.py exit code: (\d+)", l) for l in segment]
+    codes = [c.group(1) for c in codes if c]
+    if not segment:
+        problems.append(f"the Slurm log has no segment for run {run_id}")
+    elif codes != ["0"]:
+        problems.append(f"Slurm log of run {run_id} shows build exit codes {codes}, expected exactly one 0")
+    # (3) the calls log is this build's: one line per call, as many as the budget counted
+    try:
+        calls = calls_log_summary(calls_log)
+    except (OSError, ValueError) as e:
+        return fail(f"calls log unreadable: {e}")
+    if manifest.get("llm_calls_used") != calls["n_calls"]:
+        problems.append(f"calls log has {calls['n_calls']} calls but the manifest counted {manifest.get('llm_calls_used')}")
+    # (4) the config of the chain is the reviewed one
+    if not config_file or not os.path.isfile(config_file) or chunking.file_sha256(config_file) != state["config_sha256"]:
+        problems.append("the config file differs from the one this chunk was generated with")
+    if spec:
+        guard = manifest.get("context_guard") or {}
+        if not (isinstance(guard.get("checked"), int) and isinstance(guard.get("overflow"), int)
+                and guard["checked"] == calls["n_calls"] + guard["overflow"]):
+            problems.append(f"context-guard evidence is inconsistent: checked={guard.get('checked')}, calls={calls['n_calls']}, "
+                            f"overflow={guard.get('overflow')} (expected checked == calls + overflow)")
+        if calls["n_failed"]:
+            problems.append(f"the calls log has {calls['n_failed']} failed model calls (the historical policy excuses none)")
+    if problems:
+        return fail(*problems)
+    # (5) everything the normal seal checks (chain, checker, calls log, guard, cap, duplicates, leakage, totals); under the
+    # historical policy the checker additionally proves exactly the three events / nine failures and nothing else technical
+    res = validate_chunk(chunk_dir, anchor_file, reserved_file, calls_log, 0, require_context_guard, seal="ancestors",
+                         historical=spec)
+    if res["code"] != 0:
+        return res
+    if spec and (res.get("tolerated") or {}).get("historical") is None:
+        return fail("the historical exception was requested but the checker found no matching incidents")
+    evidence = {"reason": "final validation crashed after generation (checker/report tool mismatch); revalidated and sealed later",
+                "slurm_log": os.path.basename(slurm_log), "slurm_log_sha256": chunking.file_sha256(slurm_log),
+                "build_exit_code_lines": codes, "manifest_slurm_job_id": manifest["slurm_job_id"],
+                "manifest_llm_calls_used": manifest["llm_calls_used"], "manifest_git": manifest.get("git"),
+                "code_fingerprint": fingerprint()}
+    if spec:
+        report_dir = csr.latest_report_dir(chunk_dir)
+        hashed = {"calls_log": calls["sha256"], "slurm_log": evidence["slurm_log_sha256"],
+                  "manifest": chunking.file_sha256(os.path.join(chunk_dir, "generation_manifest.json")),
+                  "state": state["self_sha256"]}
+        for fname in ("generation_events.jsonl", "generation_failures.jsonl", "schema_ledger.jsonl", "generation_summary.json"):
+            fpath = os.path.join(report_dir, fname) if report_dir else None
+            hashed[fname] = chunking.file_sha256(fpath) if fpath and os.path.isfile(fpath) else None
+        evidence["historical_tolerance"] = {
+            "policy": spec["policy"], "chunk": spec["chunk"], "ids": sorted(spec["ids"]),
+            "events": res["tolerated"]["historical"]["events"], "failures": res["tolerated"]["historical"]["failures"],
+            "event_detail": spec["event_detail"], "failure_detail": spec["failure_detail"],
+            "guard": {k: (manifest.get("context_guard") or {}).get(k) for k in ("checked", "overflow", "largest_prompt_tokens")},
+            "evidence_sha256": hashed, "uncertainty": HISTORICAL_ORIGIN_NOTE,
+            "no_example_or_sidecar_for_failed_attempts": True, "failed_attempts_remain_in_ledger": True}
+    try:
+        checker = {"code": res["code"], "verdict": res["verdict"], "counts": res["counts"], "warnings": len(res["warnings"])}
+        if res.get("tolerated"):
+            checker["tolerated"] = res["tolerated"]
+        chunking.write_seal(chunk_dir, state, checker, calls, 0, require_context_guard, recovery=evidence)
+        chunking.load_seal(chunk_dir, state)
+    except (chunking.ChunkError, OSError, ValueError) as e:
+        return csr._result(res["counts"], [f"could not write a valid success marker: {e}"], [], [], res["warnings"])
+    res["sealed"], res["recovered"] = True, True
+    return res
+
+
 def merge_chain(root, names, anchor_file, out_dir, reserved_file=None):
     """Copies the explicitly chosen, fully validated chain (1..N) into a NEW directory. Sources are only read."""
     dirs = [os.path.join(os.path.abspath(root), n) for n in names]
@@ -323,6 +581,16 @@ def main(argv=None):
     p.add_argument("--reserved-file"); p.add_argument("--calls-log", required=True)
     p.add_argument("--build-exit-code", type=int, required=True)
     p.add_argument("--require-context-guard", type=int, default=None, metavar="MAX_MODEL_LEN")
+    p = sub.add_parser("recover-seal"); p.add_argument("chunk_dir"); p.add_argument("--anchor-file", required=True)
+    p.add_argument("--reserved-file", required=True); p.add_argument("--calls-log", required=True)
+    p.add_argument("--slurm-log", required=True); p.add_argument("--config-file", required=True)
+    p.add_argument("--require-context-guard", type=int, required=True, metavar="MAX_MODEL_LEN")
+    p.add_argument("--confirm-recovery", required=True, metavar="CHUNK_DIR_NAME")
+    p.add_argument("--authorize-historical-timeouts", default=None, metavar="POLICY_ID",
+                   help=f"one-time exception, value must be {HISTORICAL_POLICY['policy']}; needs --historical-timeout-ids")
+    p.add_argument("--historical-timeout-ids", nargs="+", default=None, metavar="ATTEMPT_ID",
+                   help="the exact attempt ids to excuse (no other id is ever accepted)")
+    sub.add_parser("selfcheck"); sub.add_parser("fingerprint")
     p = sub.add_parser("resolve"); p.add_argument("--root", required=True); p.add_argument("--index", type=int, required=True)
     p.add_argument("--anchor-file", required=True); p.add_argument("--reserved-file", required=True)
     p.add_argument("--chunks", type=int, required=True); p.add_argument("--totals", required=True)
@@ -365,6 +633,8 @@ def main(argv=None):
         for label in ("technical", "invalid", "shortfall", "warnings"):
             for item in res[label][:20]:
                 print(f"  [{label}] {item}")
+        if res.get("tolerated"):
+            print(f"  [tolerated] {json.dumps(res['tolerated'], sort_keys=True)[:600]}")
         return res["code"]
     if a.cmd == "seal":
         res = seal_chunk(a.chunk_dir, a.anchor_file, a.reserved_file, a.calls_log, a.build_exit_code, a.require_context_guard)
@@ -373,6 +643,32 @@ def main(argv=None):
         for label in ("technical", "invalid", "shortfall", "warnings"):
             for item in res[label][:20]:
                 print(f"  [{label}] {item}")
+        return res["code"]
+    if a.cmd == "selfcheck":
+        problems = selfcheck()
+        for item in problems:
+            print(f"SELFCHECK FAILED: {item}", file=sys.stderr)
+        if problems:
+            print("This checkout is stale or inconsistent: compare `python src/chunked_run.py fingerprint` with the reviewed checkout.",
+                  file=sys.stderr)
+        else:
+            print("selfcheck ok: checker and report tool accept per-task chunk quotas")
+        return 3 if problems else 0
+    if a.cmd == "fingerprint":
+        for rel, digest in fingerprint().items():
+            print(f"{digest or 'MISSING'}  {rel}")
+        return 0
+    if a.cmd == "recover-seal":
+        res = recover_seal(a.chunk_dir, a.anchor_file, a.reserved_file, a.calls_log, a.slurm_log, a.config_file,
+                           a.require_context_guard, a.confirm_recovery, a.authorize_historical_timeouts,
+                           a.historical_timeout_ids)
+        print(f"CHUNK RECOVERY: {res['verdict']}  chain={res.get('chain')} cumulative={res.get('cumulative')} "
+              f"this chunk={res['counts']} sealed={bool(res.get('sealed'))}")
+        for label in ("technical", "invalid", "shortfall", "warnings"):
+            for item in res[label][:20]:
+                print(f"  [{label}] {item}")
+        if res.get("tolerated"):
+            print(f"  [tolerated] {json.dumps(res['tolerated'], sort_keys=True)[:600]}")
         return res["code"]
     if a.cmd == "resolve":
         code, name, valid, ignored = resolve_chunk(a.root, a.index, a.anchor_file, a.reserved_file, a.chunks,

@@ -430,6 +430,8 @@ elif args[0] == "src/build_benchmark.py":
     if os.environ["SMOKE_SCENARIO"] == "cancel":
         time.sleep(30)
     sys.exit(1 if os.environ["SMOKE_SCENARIO"] == "error" else 0)
+elif args[0] == "src/chunked_run.py" and args[1] in ("selfcheck", "fingerprint"):
+    pass
 elif args[0] == "src/chunked_run.py" and args[1] == "increments":
     print(json.dumps({"chunks": [{"create": 167, "fix": 166, "modify": 166}] * 8}))
 elif args[0] == "src/chunked_run.py":

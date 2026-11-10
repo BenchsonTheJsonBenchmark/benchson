@@ -61,6 +61,15 @@ def _is_context_overflow(error):
     return bool(getattr(error, "is_context_overflow", False))
 
 
+def _is_token_count_error(error):
+    return bool(getattr(error, "is_token_count_error", False))
+
+
+def _token_count_stage(error):
+    """Failure stage of a failed /tokenize request: a timeout of the count is its own (bounded, tolerated) stage."""
+    return "token_count_timeout" if getattr(error, "kind", None) == "timeout" else "token_count_error"
+
+
 def _overflow_info(error):
     return {"prompt_tokens": error.prompt_tokens, "max_tokens": error.max_tokens,
             "max_model_len": error.max_model_len, "messages": error.n_messages}
@@ -93,7 +102,12 @@ class _CountingLLM:
             if self.sink:
                 # A request refused BEFORE sending because it cannot fit the context window is an expected capacity
                 # exclusion; every other provider error stays a (technical) provider_error.
-                kind = "context_overflow" if _is_context_overflow(e) else "provider_error"
+                if _is_context_overflow(e):
+                    kind = "context_overflow"
+                elif _is_token_count_error(e):
+                    kind = _token_count_stage(e)      # token_count_timeout | token_count_error (the count, not the model)
+                else:
+                    kind = "provider_error"
                 self.sink(kind, f"{type(e).__name__}: {str(e)[:300]}")
             raise
         if self.sink:
@@ -810,9 +824,11 @@ class BenchmarkBuilder:
                         result = fut.result()
                     except Exception as e:   # one bad schema must not stop the run
                         print(f"[{split}] worker error (skipped): {e}")
+                        # A failed /tokenize request has its own stage; every other exception stays a worker_error.
+                        stage = _token_count_stage(e) if _is_token_count_error(e) else "worker_error"
                         result = {"instance_id": full_id, "produced": {}, "meta": {}, "llm_calls": 0,
                                   "reference": None,
-                                  "failures": [{"task": t, "mode": m, "schema_id": full_id, "stage": "worker_error",
+                                  "failures": [{"task": t, "mode": m, "schema_id": full_id, "stage": stage,
                                                 "detail": str(e)} for t, m in needed.items()]}
                     with lock:
                         for k in needed:
@@ -1122,7 +1138,8 @@ class BenchmarkBuilder:
         for event in self._events:
             counts[event["kind"]] = counts.get(event["kind"], 0) + 1
         return {"counts": dict(sorted(counts.items())),
-                "note": "provider_error = the model call raised; suspected_truncation = JSON-looking "
+                "note": "provider_error = the model call raised; token_count_timeout / token_count_error = the "
+                        "/tokenize request failed (no model call was made); suspected_truncation = JSON-looking "
                         "answer that never closed or an unclosed <think> block (heuristic); "
                         "empty_response = blank answer. Details in generation_events.jsonl."}
 

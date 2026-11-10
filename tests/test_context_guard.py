@@ -7,7 +7,7 @@ sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "src")); sys.pat
 import check_smoke_result as csr
 from data_generation import anchor as A
 from data_generation.benchmark_builder import BenchmarkBuilder
-from llm.context_guard import ContextGuardProvider, ContextOverflow, is_context_overflow
+from llm.context_guard import ContextGuardProvider, ContextOverflow, TokenCountError, is_context_overflow
 from llm.llm_provider import LLMProvider
 from llm.mock.mock_provider import MockProvider
 from llm.recording_provider import CallBudget, ProviderFailing, RecordingProvider
@@ -71,7 +71,7 @@ class GuardUnitTest(unittest.TestCase):
             g.generate([{"role": "user", "content": "x"}])
         _, g = self.guard(RuntimeError("tokenize down"))
         for _ in range(2):
-            with self.assertRaises(RuntimeError):         # reported, never silently skipped
+            with self.assertRaises(TokenCountError):      # reported (typed), never silently skipped
                 g.generate([{"role": "user", "content": "x"}])
         with self.assertRaises(ProviderFailing):
             g.generate([{"role": "user", "content": "x"}])

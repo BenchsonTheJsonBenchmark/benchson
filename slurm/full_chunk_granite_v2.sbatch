@@ -97,6 +97,11 @@ import sys
 rows = json.load(sys.stdin)["chunks"]
 print(",".join(f"{task}={rows[int(sys.argv[1]) - 1][task]}" for task in ("create", "fix", "modify")))
 ' "$CHUNK_INDEX") || fail "cannot compute the chunk quota"
+# Deployment self-check (CPU, before any GPU time): a stale checker/report tool crashed the first full chunk AFTER its generation finished.
+"$BENCHSON_PYTHON" src/chunked_run.py selfcheck \
+    || fail "deployment self-check failed: stale or mismatched source files (compare 'python src/chunked_run.py fingerprint' with the reviewed checkout)"
+echo "--- code fingerprint (sha256) ---"
+"$BENCHSON_PYTHON" src/chunked_run.py fingerprint || fail "cannot fingerprint the checkout"
 # The schema pool comes from the published training rows (docs/schema_reuse.md); data/jsb_schemas is not needed for it.
 POOL_SOURCE=$("$BENCHSON_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["reuse"]["pool_source"])' "$CONFIG") \
     || fail "cannot read reuse.pool_source from $CONFIG"

@@ -105,7 +105,7 @@ def verify_files(chunk_dir, state):
                              f"(missing {missing[:3]}, unexpected {extra[:3]}, changed {changed[:3]})")
 
 
-def write_seal(chunk_dir, state, checker, calls_log, build_exit_code, context_guard=None):
+def write_seal(chunk_dir, state, checker, calls_log, build_exit_code, context_guard=None, recovery=None):
     """The final success marker: written once (never overwrites), only after every final validation passed.
     It binds the run identity, the hash of the validated state (and so of every example file), the exact counts,
     the final checker result and the calls-log validation result."""
@@ -115,6 +115,8 @@ def write_seal(chunk_dir, state, checker, calls_log, build_exit_code, context_gu
             "counts": dict(state["counts"]), "checker": checker, "calls_log": calls_log,
             "build_exit_code": build_exit_code, "context_guard_required": context_guard,
             "created": datetime.datetime.now().isoformat(timespec="seconds")}
+    if recovery is not None:   # a late, explicit recovery says so in the marker; the marker is verified exactly like any other
+        body["recovery"] = recovery
     body["self_sha256"] = canonical_sha256(body)
     with open(os.path.join(chunk_dir, SEAL_FILE), "x", encoding="utf-8") as f:   # "x": an existing marker is never replaced
         json.dump(body, f, indent=1, sort_keys=True)
