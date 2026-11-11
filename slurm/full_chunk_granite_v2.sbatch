@@ -334,32 +334,92 @@ MODEL_PATH=$(cat "$JOB_SCRATCH/model-path")
 [ -d "$MODEL_PATH" ] || { echo "invalid model path"; exit 11; }
 echo "Model ready at: $MODEL_PATH"
 
+# ---- vLLM startup diagnostics (bounded; never prints the API key, a command line or the environment) ----------
+VLLM_LOG="logs/full-vllm-${RUN_ID}.log"
+READY_TIMEOUT_SEC=1800        # unchanged intent of the old loop (180 polls x 10 s); now enforced as a wall-clock deadline
+READY_POLL_SEC=10
+READY_REPORT_EVERY_SEC=60
+# BEGIN vllm-diagnostics (the offline tests source exactly this block)
+vllm_redact() {   # stdin -> stdout: the key and any bearer token removed, every line cut to 300 characters
+    awk 'BEGIN { k = ENVIRON["VLLM_API_KEY"] }
+         { if (k != "") { while ((i = index($0, k)) > 0) $0 = substr($0, 1, i - 1) "[REDACTED]" substr($0, i + length(k)) }
+           gsub(/[Bb]earer [A-Za-z0-9._~+\/=-]+/, "Bearer [REDACTED]"); print substr($0, 1, 300) }'
+}
+vllm_proc_state() {   # one letter from /proc/<pid>/stat (R S D T Z X ...), or "gone"; the command name may contain ")" or spaces
+    local s
+    [ -r "/proc/$1/stat" ] || { echo gone; return; }
+    s=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -c1)
+    echo "${s:-gone}"
+}
+vllm_alive() {        # a zombie (Z) or dead (X) process still answers kill -0 until it is reaped: it is NOT alive
+    case "$(vllm_proc_state "$1")" in gone|Z|X) return 1 ;; esac
+    kill -0 "$1" 2>/dev/null
+}
+vllm_diag() {         # $1 = what happened; at most ~80 lines, nothing secret
+    local pid="$VLLM_PID" f cg
+    echo "--- vLLM diagnostics: $1 ---"
+    echo "waited=$((SECONDS - READY_START))s probes=${PROBES:-0} last_curl_rc=${CURL_RC:--} pid=${pid} state=$(vllm_proc_state "$pid")"
+    ps -o pid=,ppid=,stat=,etimes=,rss=,nlwp=,comm= -p "$pid" 2>/dev/null | head -n 3
+    ps -o pid=,stat=,etimes=,rss=,comm= --sid "$pid" 2>/dev/null | head -n 15
+    grep -E '^(State|VmRSS|VmSwap|Threads):' "/proc/$pid/status" 2>/dev/null | head -n 4
+    echo "wchan=$(head -c 60 "/proc/$pid/wchan" 2>/dev/null)"
+    cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -n 1)"
+    for f in memory.current memory.peak memory.max memory.events; do
+        [ -r "$cg/$f" ] && echo "cgroup $f: $(head -c 200 "$cg/$f" | tr '\n' ' ')"
+    done
+    command -v nvidia-smi >/dev/null 2>&1 && timeout 10 nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>&1 | head -n 2
+    if [ -f "$VLLM_LOG" ]; then
+        echo "vLLM log: $(wc -c < "$VLLM_LOG") bytes, last 40 lines:"
+        tail -c 16384 "$VLLM_LOG" | tail -n 40 | vllm_redact
+    else
+        echo "vLLM log missing: $VLLM_LOG"
+    fi
+    echo "--- end of vLLM diagnostics ---"
+}
+# END vllm-diagnostics
+
 echo "=== Starting vLLM on 127.0.0.1:${SERVER_PORT} ==="
 # VLLM_API_KEY (exported above) is read by vLLM itself, so the key never appears in the process list.
-setsid "$VLLM_BIN" serve "$MODEL_PATH" \
+# PYTHONUNBUFFERED applies to the server process only; stdout and stderr still go to the same per-run log.
+PYTHONUNBUFFERED=1 setsid "$VLLM_BIN" serve "$MODEL_PATH" \
     --served-model-name "$GRANITE_MODEL_ID" \
     --host 127.0.0.1 --port "$SERVER_PORT" \
     --tensor-parallel-size 1 \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.90 \
-    > "logs/full-vllm-${RUN_ID}.log" 2>&1 &
+    > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-echo "=== Waiting for vLLM ==="
-READY=0
-for i in $(seq 1 180); do
-    if printf 'header = "Authorization: Bearer %s"\n' "$VLLM_API_KEY" \
-        | curl -qsf --noproxy 127.0.0.1 --max-time 10 -K - "$VLLM_BASE_URL/models" >/dev/null; then
+echo "=== Waiting for vLLM (deadline ${READY_TIMEOUT_SEC}s, poll ${READY_POLL_SEC}s) ==="
+READY=0; PROBES=0; CURL_RC=-; READY_START=$SECONDS; NEXT_REPORT=$((SECONDS + READY_REPORT_EVERY_SEC))
+while :; do
+    PROBES=$((PROBES + 1))
+    printf 'header = "Authorization: Bearer %s"\n' "$VLLM_API_KEY" \
+        | curl -qsf --noproxy 127.0.0.1 --connect-timeout 3 --max-time 10 -K - "$VLLM_BASE_URL/models" >/dev/null
+    CURL_RC=${PIPESTATUS[1]}
+    if [ "$CURL_RC" -eq 0 ]; then
         READY=1
+        echo "vLLM ready after $((SECONDS - READY_START))s (${PROBES} probes)."
         break
     fi
-    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
-        echo "vLLM process exited (see logs/full-vllm-${RUN_ID}.log)."
+    if ! vllm_alive "$VLLM_PID"; then
+        wait "$VLLM_PID" 2>/dev/null; SERVER_RC=$?
+        echo "vLLM server process EXITED before it became ready (wait status ${SERVER_RC}; see ${VLLM_LOG})."
+        vllm_diag "server process exited"
         exit 11
     fi
-    sleep 10
+    if [ $((SECONDS - READY_START)) -ge "$READY_TIMEOUT_SEC" ]; then
+        echo "vLLM did not become ready within ${READY_TIMEOUT_SEC}s: the server process is still ALIVE but not answering (see ${VLLM_LOG})."
+        vllm_diag "alive but not ready"
+        exit 11
+    fi
+    if [ "$SECONDS" -ge "$NEXT_REPORT" ]; then
+        echo "vLLM waiting: $((SECONDS - READY_START))s/${READY_TIMEOUT_SEC}s state=$(vllm_proc_state "$VLLM_PID") last_curl_rc=${CURL_RC} log_bytes=$(wc -c < "$VLLM_LOG" 2>/dev/null || echo 0)"
+        NEXT_REPORT=$((SECONDS + READY_REPORT_EVERY_SEC))
+    fi
+    sleep "$READY_POLL_SEC"
 done
-[ "$READY" -eq 1 ] || { echo "vLLM did not become ready (see logs/full-vllm-${RUN_ID}.log)."; exit 11; }
+[ "$READY" -eq 1 ] || { echo "vLLM did not become ready (see ${VLLM_LOG})."; exit 11; }
 
 # ---- 2. One chunk ---------------------------------------------------------------------------------
 echo "=== Running chunk ${CHUNK_INDEX}/${N_CHUNKS} (quota ${QUOTA}; max ${MAX_LLM_CALLS} calls, ${GEN_TIMEOUT_SEC}s) ==="
