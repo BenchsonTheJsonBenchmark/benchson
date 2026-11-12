@@ -203,8 +203,9 @@ def validate_chunk(chunk_dir, anchor_file, reserved_file=None, calls_log=None, b
                 if h not in train or h in test:
                     invalid.append(f"{cdir}/{task}/{name}: schema is not a published train schema or overlaps the test set")
                 if cdir != last_dir:   # the last chunk was already checked example by example by csr.check
-                    problems, _ = csr.example_problems(task, rec, 0.9)
+                    problems, tech, _ = csr.example_findings(task, rec, 0.9)
                     invalid.extend(f"{cdir}/{task}/{name}: {p}" for p in problems)
+                    technical.extend(f"{cdir}/{task}/{name}: {t}" for t in tech)
                 rh = reference_hash(task, rec)
                 if rh in pub_refs.get(h, ()):
                     invalid.append(f"{task}/{name}: its reference equals a published reference of the same schema")
@@ -231,6 +232,8 @@ def validate_chunk(chunk_dir, anchor_file, reserved_file=None, calls_log=None, b
         if cum[t] != totals[t] * k // n:
             invalid.append(f"{t}: cumulative {cum[t]} after chunk {k}, expected {totals[t] * k // n}")
     res = csr._result(counts, technical, invalid, shortfall, warnings, base.get("tolerated"))
+    from evaluations import schema_validation
+    res["remote_documents"] = schema_validation.used_documents()   # report only: what the external $refs resolved to in THIS process
     res["chain"] = [os.path.basename(d) for d, _ in chain]
     res["cumulative"] = cum
     res["chunk_index"], res["n_chunks"] = k, n
@@ -336,6 +339,7 @@ RUNTIME_FILES = ("src/build_benchmark.py", "src/check_smoke_result.py", "src/chu
                  "src/data_generation/anchor.py", "src/data_generation/benchmark_builder.py", "src/data_generation/chunking.py",
                  "src/data_generation/published.py", "src/data_generation/reuse.py", "src/data_generation/tasks/base_task.py",
                  "src/llm/context_guard.py", "src/llm/openai/openai_provider.py", "src/llm/recording_provider.py",
+                 "src/evaluations/schema_validation.py",
                  "configs/scale_only_vllm_granite.json", "slurm/full_chunk_granite_v2.sbatch",
                  "slurm/full_chunk_chain_job.sbatch", "slurm/submit_chunk_chain.sh")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -633,6 +637,8 @@ def main(argv=None):
         for label in ("technical", "invalid", "shortfall", "warnings"):
             for item in res[label][:20]:
                 print(f"  [{label}] {item}")
+        for uri, digest in (res.get("remote_documents") or {}).items():
+            print(f"  [remote_document] sha256={digest} {uri}")
         if res.get("tolerated"):
             print(f"  [tolerated] {json.dumps(res['tolerated'], sort_keys=True)[:600]}")
         return res["code"]

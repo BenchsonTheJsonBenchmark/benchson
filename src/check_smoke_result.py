@@ -81,52 +81,68 @@ def _jsonl(path, technical):
     return rows
 
 
-def example_problems(task, record, grounding_threshold=0.9):
-    """Reasons an example is not a valid one (empty list = valid) and non-blocking warnings."""
-    from evaluations import metrics
-    problems, warnings = [], []
+def example_findings(task, record, grounding_threshold=0.9):
+    """(invalid, technical, warnings) for one example.
+
+    invalid   - the example is genuinely wrong (a resolvable, well-formed schema is violated, a field is missing, ...).
+    technical - validity could not be established (external $ref unreachable / timed out, malformed schema, validator crash).
+                That is never evidence that the example is invalid and never a pass: it blocks like any technical failure.
+    Fix keeps both requirements: valid_json must be VALID and erroneous_json must be INVALID; a technical result on either
+    side proves neither. Modify's ground_truth may be schema-invalid, so only a warning is lost when it cannot be validated."""
+    from evaluations import schema_validation as sv
+    problems, technical, warnings = [], [], []
     if not isinstance(record, dict):
-        return ["not a JSON object"], warnings
+        return ["not a JSON object"], technical, warnings
     may_be_empty = ("reference_json", "data", "ground_truth", "valid_json", "erroneous_json")   # {} / [] are legal JSON values
     for field in REQUIRED[task]:
         if field not in record or (field not in may_be_empty and record[field] in (None, "", [], {})):
             problems.append(f"missing or empty field '{field}'")
     if problems:
-        return problems, warnings
+        return problems, technical, warnings
     schema = record["schema"]
     if not isinstance(schema, dict):
-        return ["schema is not an object"], warnings
+        return ["schema is not an object"], technical, warnings
 
-    def valid(obj):
-        return metrics.schema_compliance(obj, schema)[0] == 1
+    def status(field, blocking=True):
+        state, detail = sv.validate_instance(record[field], schema)
+        if state == sv.TECHNICAL:
+            (technical if blocking else warnings).append(f"{field} could not be validated (not evidence of invalidity): {detail}")
+        return state
 
     if task == "create":
         if not isinstance(record["description"], str) or not record["description"].strip():
             problems.append("empty description")
-        if not valid(record["reference_json"]):
+        state = status("reference_json")
+        if state == sv.INVALID:
             problems.append("reference_json does not satisfy the schema")
-        else:
+        elif state == sv.VALID:
             from data_generation.benchmark_builder import _grounding_ratio
             ratio = _grounding_ratio(record["reference_json"], record["description"])
             if ratio < grounding_threshold:
                 problems.append(f"grounding {ratio:.2f} below threshold {grounding_threshold}")
     elif task == "fix":
-        if not valid(record["valid_json"]):
+        if status("valid_json") == sv.INVALID:
             problems.append("valid_json does not satisfy the schema")
-        if valid(record["erroneous_json"]):
+        if status("erroneous_json") == sv.VALID:
             problems.append("erroneous_json is actually valid (nothing to fix)")
         if record["erroneous_json"] == record["valid_json"]:
             problems.append("erroneous_json equals valid_json")
     else:
         if not isinstance(record["instructions"], str) or not record["instructions"].strip():
             problems.append("empty instructions")
-        if not valid(record["data"]):
+        if status("data") == sv.INVALID:
             problems.append("data does not satisfy the schema")
         if record["ground_truth"] == record["data"]:
             problems.append("ground_truth equals data (the edit changed nothing)")
-        if not valid(record["ground_truth"]):
+        if status("ground_truth", blocking=False) == sv.INVALID:
             warnings.append("ground_truth does not satisfy the schema (allowed by the original Modify task)")
-    return problems, warnings
+    return problems, technical, warnings
+
+
+def example_problems(task, record, grounding_threshold=0.9):
+    """Compatibility wrapper: (invalid + technical reasons, warnings). New code uses example_findings to tell them apart."""
+    invalid, technical, warnings = example_findings(task, record, grounding_threshold)
+    return invalid + technical, warnings
 
 
 def latest_report_dir(out_dir):
@@ -307,7 +323,8 @@ def check(out_dir, per_task=2, calls_log=None, build_exit_code=None, grounding_t
             except (OSError, ValueError) as e:
                 invalid.append(f"{task}/{name}: unreadable ({e})")
                 continue
-            problems, warns = example_problems(task, record, grounding_threshold)
+            problems, tech, warns = example_findings(task, record, grounding_threshold)
+            technical.extend(f"{task}/{name}: {t}" for t in tech)
             if train_hashes is not None and isinstance(record, dict) and isinstance(record.get("schema"), dict):
                 from data_generation.published import schema_hash
                 h = schema_hash(record["schema"])
