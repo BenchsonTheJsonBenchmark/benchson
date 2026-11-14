@@ -80,6 +80,11 @@ Design (`src/data_generation/chunking.py`, `src/chunked_run.py`, `slurm/full_chu
 - Merge: `chunked_run.py merge --root ... --chain c01_... ... c08_... --anchor-file ... --out-dir NEW` copies the explicitly named,
   fully validated chain into a new directory (refuses an existing one; sources are only read; every copy is hash-checked) with
   `merged_chunks_manifest.json`. Combining it with the published baseline is the existing `src/merge_scale_dataset.py` step.
+  `merge_scale_dataset.py` first verifies the baseline against its pinned manifest (SHA256, git blob ids, every file equals its published
+  row) and the merged-chunks manifest (8 chunks, quotas, file hashes), builds the result in a private staging directory next to
+  `--out-dir`, verifies every output file by SHA256 and only then renames it into place (an existing destination is never reused).
+  With `--chunks-root --anchor-file --reserved-file` it also re-validates the sealed chain; without them only the manifest-level chain is
+  checked and `merge_manifest.json` says so. `--max-new-references-per-schema 3` re-checks the generation cap from the merged files.
 - The published baseline directory is only ever read (tested by hashing the tree before and after).
 
 Limitation: a chunk is not resumable in the middle. Preemption loses at most one chunk (about 30 minutes of generation); the
