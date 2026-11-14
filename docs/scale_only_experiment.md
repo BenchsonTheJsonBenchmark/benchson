@@ -180,3 +180,19 @@ Scale-only changes TWO things relative to the published data, so it does **not**
 Further caveats: the pool is limited to schemas that already occur in the published train set (schema diversity does not grow), a documented 10 KB size
 restriction removes larger schemas (the published train set contains some), temperature 0.7 / max tokens 4096 / top_p 0.95 are provisional,
 and the published train and test sets already share some schema content (reported by the importer).
+
+## Dataset quality audit (read-only, before training)
+
+`src/audit_scale_dataset.py` compares the original 3,000, the new 4,000 and the merged 7,000 training examples (the 450 test examples only for
+integrity and leakage). It never writes to its inputs; `--out-dir` must be new and is published atomically from a staging directory.
+
+```
+python src/audit_scale_dataset.py --baseline data_published/7962b0947f7d --new data_scale_only/merged_4k_20261114 \
+  --merged data_scale_7k_20261114 --jsonl hf_export_7k_20261114 --out-dir outputs/quality_audit/scale_only_7k_20261114 \
+  --chunks-root data_scale_only/full/chunks --anchor-file data_published/7962b0947f7d/published_train_schemas.json \
+  --reserved-file data_published/7962b0947f7d/reserved_schemas.json
+```
+Outputs: `quality_report.md` (three separate verdicts: data integrity, training readiness, scientific comparability; metric definitions), `summary.json`, `metrics_by_task.csv`,
+`validation_failures.csv`, `complexity_metrics.csv`, `duplicates_and_reuse.csv`, `provenance_report.json`. Validation is the existing three-way
+VALID / INVALID / TECHNICAL (`schema_validation.validate_instance`): TECHNICAL is never counted as invalid or valid and keeps the verdict at
+NOT READY (fail closed). Genuine defects in the ORIGINAL dataset are never hidden or altered: they give REVIEW REQUIRED (exit code 3; 0 = READY, 2 = NOT READY). Results that depend on the jsonschema version (`$ref` with sibling keywords) are UNCONFIRMED, not defects. `--offline` forbids network access.
