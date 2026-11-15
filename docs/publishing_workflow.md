@@ -67,3 +67,48 @@ commands (not executed). The script refuses the original repo id, a non-empty ou
 whose schema is in the original test split, and any change to the test split or the original train rows.
 The scale-only generation, merge and duplicate checks run on the cluster against `data_published/<sha12>` (imported from
 the original pinned revision, not from our repo), so they do not depend on our repo.
+
+## Step 3: publish `scale-only-7k` (`src/publish_scale_only.py`)
+
+`prepare_hf_release.py --variant scale-only-7k` predates the controlled-reuse policy (its card says "original train first" and "schemas disjoint
+from the original"), so it is not used for the 7K branch. `publish_scale_only.py` publishes the REAL JSONL export of the merge, byte for byte.
+Branch `scale-only-7k` is created from the verified `main` (commit `1e8aad270c7f0e1f82d139bbe1e32a345188b697`); `main` is never written.
+
+```bash
+# on the BGU cluster (has the data; no token, no network needed). Copy only src/publish_scale_only.py (targeted, no git pull).
+python src/publish_scale_only.py build --export hf_export_7k_20261114 --baseline data_published/7962b0947f7d \
+    --new data_scale_only/merged_4k_20261114 --merged data_scale_7k_20261114 \
+    --audit-dir outputs/quality_audit/scale_only_7k_20261114 --out-dir release/scale-only-7k
+python src/publish_scale_only.py check-release --release-dir release/scale-only-7k
+# copy release/scale-only-7k/ to the MacBook (scp -r), then there:
+python src/publish_scale_only.py check-release --release-dir release/scale-only-7k
+read -s HF_TOKEN && export HF_TOKEN
+python src/publish_scale_only.py upload --release-dir release/scale-only-7k          # you type  <repo>:scale-only-7k
+python src/publish_scale_only.py verify-remote --release-dir release/scale-only-7k --commit <printed commit>
+unset HF_TOKEN
+```
+`build` refuses (writes nothing) unless: the six files have exactly 2334/2333/2333 train and 150 test rows; the original rows are present byte for byte
+(compared with `data_published/<sha12>/original_files`, which is itself verified against the pinned revision); the remaining train rows are exactly the
+4,000 new examples encoded from the new-run files and from the merged dataset; no row is duplicated or in both splits; the audit is INTACT with
+C1/C2/C4/D/U checks passing and contains no machine-specific path. The release folder holds the six data files, `README.md` (card generated from the
+audit and the config), `NOTICE.md`, `ORIGINAL_DATASET_CARD.md`, `PROVENANCE.json` (SHA256, git blob ids, counts, audit verdicts and file hashes),
+`row_origin.tsv` (original/new per line) and `audit/{quality_report.md,summary.json,provenance_report.json}`. The bulky per-example audit CSVs stay local;
+their SHA256 is recorded in `PROVENANCE.json`. `verify-remote` re-downloads the commit, compares every file, and checks that `main` is unchanged and the repo private.
+
+### Publication record: `scale-only-7k` (verified 2026-11-15)
+
+| | |
+|---|---|
+| Repository (private) | `benchson-research/benchson-data-experiments` |
+| Branch | `scale-only-7k` |
+| Verified commit (immutable) | `668a6773c6935e445cc04765b58e419ecdeebb0c` |
+| `main` commit (unchanged) | `1e8aad270c7f0e1f82d139bbe1e32a345188b697` |
+| Original dataset | `aviv1ron1/Benchson` @ `7962b0947f7d96eb3a0e6b9b928d939c7f3061a6` |
+| Content | six JSONL files: 7,000 train (create 2,334 / fix 2,333 / modify 2,333) and 450 test (150 per task); 14 published files in total |
+| Remote verification | `verify-remote` PASSED: every published file matches its expected SHA256, the repository is private, `main` is unchanged |
+
+Dataset audit verdicts (`src/audit_scale_dataset.py`, full report in `audit/quality_report.md` on the branch):
+
+- Data integrity: INTACT.
+- Training readiness: REVIEW REQUIRED, due to three validation defects in the ORIGINAL baseline (one per task). They are preserved exactly as published; nothing was changed or excluded.
+- Scientific comparability: ESTABLISHED for the reported metrics.
